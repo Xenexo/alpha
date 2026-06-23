@@ -19,8 +19,19 @@ let isClaudeActive = false;
 // Claude Code CLI state
 let cliPath = null;
 let cliEnv = null;
-let cliSessionId = null; // for --resume, keeps conversation context across invocations
-let activeCliProc = null;
+let cliSessionId = null; // session_id from SDK / --resume, keeps conversation context
+let activeCliProc = null;  // subprocess handle (image path only)
+let activeCliAbort = null; // AbortController for in-flight SDK query (text path)
+
+// Lazy-loaded @anthropic-ai/claude-code query function
+let _queryFn = null;
+async function getQueryFn() {
+    if (!_queryFn) {
+        const sdk = await import('@anthropic-ai/claude-code');
+        _queryFn = sdk.query;
+    }
+    return _queryFn;
+}
 
 const CLI_TIMEOUT_MS = 120000;
 
@@ -78,7 +89,7 @@ async function resolveClaudeCli() {
 
 function runClaudeCli(prompt, { allowedTools } = {}) {
     return new Promise(resolve => {
-        const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+        const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', claudeModel];
         // --append-system-prompt is per-invocation; --resume does not persist it
         if (currentSystemPrompt) {
             args.push('--append-system-prompt', currentSystemPrompt);
@@ -221,6 +232,92 @@ function runClaudeCli(prompt, { allowedTools } = {}) {
     });
 }
 
+// ── Claude Code SDK (SSE, no subprocess) ──
+// Uses the same auth as `claude login`. Eliminates per-request spawn overhead.
+
+async function runClaudeQuery(prompt) {
+    let query;
+    try {
+        query = await getQueryFn();
+    } catch (importErr) {
+        console.warn('[Claude] SDK import failed, falling back to CLI:', importErr.message);
+        return runClaudeCli(prompt);
+    }
+
+    const controller = new AbortController();
+    activeCliAbort = controller;
+
+    let committed = '';
+    let delta = '';
+    let fullText = '';
+    let isFirst = true;
+
+    try {
+        const opts = {
+            maxTurns: 1,
+            abortController: controller,
+            model: claudeModel,
+        };
+        if (currentSystemPrompt) opts.appendSystemPrompt = currentSystemPrompt;
+        if (cliSessionId) opts.resume = cliSessionId;
+
+        for await (const msg of query({ prompt, options: opts })) {
+            if (controller.signal.aborted) break;
+
+            if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
+                cliSessionId = msg.session_id;
+            } else if (msg.type === 'stream_event') {
+                const ev = msg.event;
+                if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+                    delta += ev.delta.text;
+                    fullText = committed + (committed && delta ? '\n' : '') + delta;
+                    sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                    isFirst = false;
+                }
+            } else if (msg.type === 'assistant') {
+                const text = (msg.message?.content || [])
+                    .filter(b => b.type === 'text' && b.text)
+                    .map(b => b.text)
+                    .join('');
+                if (text) committed = committed ? committed + '\n' + text : text;
+                delta = '';
+                fullText = committed;
+                if (fullText) {
+                    sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                    isFirst = false;
+                }
+            } else if (msg.type === 'result') {
+                if (msg.session_id) cliSessionId = msg.session_id;
+                if (msg.is_error || (msg.subtype && msg.subtype !== 'success')) {
+                    const errMsg = msg.result || 'Claude error';
+                    sendToRenderer('update-status', 'Claude error: ' + errMsg);
+                    return { success: false, error: errMsg };
+                }
+                const final = msg.result || fullText;
+                if (final && final !== fullText) {
+                    sendToRenderer(isFirst ? 'new-response' : 'update-response', final);
+                    fullText = final;
+                }
+            }
+        }
+    } catch (err) {
+        if (controller.signal.aborted) return { success: false, error: 'Cancelled' };
+        console.error('[Claude] SDK query error:', err);
+        let message = 'Claude error: ' + err.message;
+        if (/login|auth|unauthorized|401|credentials/i.test(err.message)) {
+            message = 'Claude not logged in — run "claude" in a terminal and sign in';
+        }
+        sendToRenderer('update-status', message);
+        return { success: false, error: message };
+    } finally {
+        if (activeCliAbort === controller) activeCliAbort = null;
+    }
+
+    if (!fullText) return { success: false, error: 'Claude returned no response' };
+    sendToRenderer('update-status', 'Listening...');
+    return { success: true, text: fullText };
+}
+
 // ── Anthropic API streaming ──
 
 async function streamAnthropicMessages(messages) {
@@ -271,6 +368,8 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         claudeConversationHistory = [];
         cliSessionId = null;
 
+        claudeModel = model || 'claude-opus-4-8';
+
         if (claudeMode === 'cli') {
             const cli = await resolveClaudeCli();
             if (!cli) {
@@ -287,7 +386,6 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
                 return false;
             }
             anthropicClient = new Anthropic({ apiKey: anthropicApiKey.trim() });
-            claudeModel = model || 'claude-opus-4-8';
         }
 
         // Load Whisper for speech-to-text (audio → transcript → Claude)
@@ -338,6 +436,8 @@ async function sendClaudeText(text) {
     console.log('[Claude] Sending text:', trimmed.substring(0, 100) + '...');
 
     if (claudeMode === 'cli') {
+        // Use the subprocess path: --include-partial-messages guarantees token-level
+        // streaming via stdout rather than relying on the SDK's async generator batching.
         const result = await runClaudeCli(trimmed);
         if (result.success && result.text) {
             saveConversationTurn(trimmed, result.text);
@@ -437,6 +537,10 @@ async function sendClaudeImage(base64Data, prompt) {
 function closeClaudeSession() {
     console.log('[Claude] Closing Claude session');
     isClaudeActive = false;
+    if (activeCliAbort) {
+        activeCliAbort.abort();
+        activeCliAbort = null;
+    }
     if (activeCliProc) {
         try {
             activeCliProc.kill('SIGTERM');
