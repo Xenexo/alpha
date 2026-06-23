@@ -19,7 +19,7 @@ export class AssistantView extends LitElement {
             flex: 1;
             overflow-y: auto;
             font-size: var(--response-font-size, 15px);
-            line-height: var(--line-height);
+            line-height: var(--line-height-relaxed);
             background: var(--bg-app);
             padding: var(--space-sm) var(--space-md);
             scroll-behavior: smooth;
@@ -52,6 +52,8 @@ export class AssistantView extends LitElement {
             margin: 1em 0 0.5em 0;
             color: var(--text-primary);
             font-weight: var(--font-weight-semibold);
+            line-height: var(--line-height-tight);
+            letter-spacing: var(--tracking-tight);
         }
 
         .response-container h1 { font-size: 1.5em; }
@@ -64,6 +66,14 @@ export class AssistantView extends LitElement {
         .response-container p {
             margin: 0.6em 0;
             color: var(--text-primary);
+        }
+
+        .response-container > :first-child {
+            margin-top: 0;
+        }
+
+        .response-container > :last-child {
+            margin-bottom: 0;
         }
 
         .response-container ul,
@@ -91,6 +101,7 @@ export class AssistantView extends LitElement {
             border-radius: var(--radius-sm);
             font-family: var(--font-mono);
             font-size: 0.85em;
+            line-height: var(--line-height-compact);
         }
 
         .response-container pre {
@@ -240,6 +251,7 @@ export class AssistantView extends LitElement {
             padding: 0;
             font-size: var(--font-size-sm);
             font-family: var(--font);
+            line-height: var(--line-height-compact);
             height: 100%;
             outline: none;
         }

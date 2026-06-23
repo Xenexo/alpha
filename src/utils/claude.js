@@ -11,10 +11,16 @@ const transcriber = require('./transcriber');
 
 let claudeMode = 'cli'; // 'cli' | 'api'
 let anthropicClient = null;
-let claudeModel = 'claude-opus-4-8';
+let claudeModel = 'claude-haiku-4-5-20251001';
 let claudeConversationHistory = [];
 let currentSystemPrompt = null;
 let isClaudeActive = false;
+let isTranscriptResponseInFlight = false;
+let pendingTranscripts = [];
+let transcriptDebounceTimer = null;
+
+const TRANSCRIPT_DEBOUNCE_MS = 600;
+const RESPONSE_UPDATE_INTERVAL_MS = 50;
 
 // Claude Code CLI state
 let cliPath = null;
@@ -34,6 +40,51 @@ async function getQueryFn() {
 }
 
 const CLI_TIMEOUT_MS = 120000;
+const API_MAX_TOKENS = 2048;
+const CLAUDE_CONCISE_RESPONSE_PROMPT = `
+
+**CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
+- Start with the direct answer. Do not add an introduction or restate the question.
+- For normal questions, respond in 1-3 short sentences and then stop.
+- Add bullets only when the user explicitly asks for steps, options, or a list.
+- For ordinary code questions, give the approach in one sentence followed by only the necessary code.
+- If asked to demonstrate, share a demo, implement live, or do hands-on coding, ignore the normal length limit. Give: (1) a one-line approach, (2) ordered implementation steps, (3) complete runnable code, and (4) exact commands to run or verify it.
+- During demos and hands-on coding, keep commentary minimal and prioritize executable instructions and code.
+- Do not add background, examples, caveats, summaries, offers to help, or follow-up questions unless they are required for correctness.
+- Never continue after the question has been fully answered.
+`;
+
+async function flushPendingTranscripts() {
+    transcriptDebounceTimer = null;
+    if (!isClaudeActive || isTranscriptResponseInFlight || pendingTranscripts.length === 0) return;
+
+    const transcription = pendingTranscripts.join(' ').trim();
+    pendingTranscripts = [];
+    if (!transcription) return;
+
+    isTranscriptResponseInFlight = true;
+    sendToRenderer('update-status', 'Generating response...');
+
+    try {
+        await sendClaudeText(transcription);
+    } finally {
+        isTranscriptResponseInFlight = false;
+        if (isClaudeActive && pendingTranscripts.length > 0) {
+            transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+        }
+    }
+}
+
+function queueTranscript(transcription) {
+    if (!isClaudeActive) return;
+    pendingTranscripts.push(transcription);
+
+    // Merge phrases separated by short VAD pauses. If Claude is already
+    // responding, flush once it finishes instead of starting concurrently.
+    if (isTranscriptResponseInFlight) return;
+    if (transcriptDebounceTimer) clearTimeout(transcriptDebounceTimer);
+    transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+}
 
 // ── Claude Code CLI detection ──
 
@@ -90,9 +141,10 @@ async function resolveClaudeCli() {
 function runClaudeCli(prompt, { allowedTools } = {}) {
     return new Promise(resolve => {
         const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', claudeModel];
-        // --append-system-prompt is per-invocation; --resume does not persist it
+        // Replace Claude Code's large coding-agent prompt. This app needs a
+        // focused assistant prompt, and processing both prompts adds latency.
         if (currentSystemPrompt) {
-            args.push('--append-system-prompt', currentSystemPrompt);
+            args.push('--system-prompt', currentSystemPrompt);
         }
         if (cliSessionId) {
             args.push('--resume', cliSessionId);
@@ -251,14 +303,50 @@ async function runClaudeQuery(prompt) {
     let delta = '';
     let fullText = '';
     let isFirst = true;
+    let responseUpdateTimer = null;
+    let lastResponseUpdateAt = 0;
+
+    const emitResponse = (force = false) => {
+        if (!fullText) return;
+        const elapsed = Date.now() - lastResponseUpdateAt;
+
+        if (!force && elapsed < RESPONSE_UPDATE_INTERVAL_MS) {
+            if (!responseUpdateTimer) {
+                responseUpdateTimer = setTimeout(() => {
+                    responseUpdateTimer = null;
+                    emitResponse(true);
+                }, RESPONSE_UPDATE_INTERVAL_MS - elapsed);
+            }
+            return;
+        }
+
+        if (responseUpdateTimer) {
+            clearTimeout(responseUpdateTimer);
+            responseUpdateTimer = null;
+        }
+        sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+        isFirst = false;
+        lastResponseUpdateAt = Date.now();
+    };
 
     try {
         const opts = {
             maxTurns: 1,
             abortController: controller,
             model: claudeModel,
+            includePartialMessages: true,
+            // Favor immediate answers over extended reasoning in the real-time
+            // assistant. Users can still select a more capable model.
+            maxThinkingTokens: 0,
+            // Plain text answers do not need Claude Code's tools or user MCP
+            // servers. Skipping their discovery reduces request startup work.
+            allowedTools: [],
+            mcpServers: {},
+            strictMcpConfig: true,
         };
-        if (currentSystemPrompt) opts.appendSystemPrompt = currentSystemPrompt;
+        // Avoid processing Claude Code's full coding-agent prompt for every
+        // conversational request.
+        if (currentSystemPrompt) opts.customSystemPrompt = currentSystemPrompt;
         if (cliSessionId) opts.resume = cliSessionId;
 
         for await (const msg of query({ prompt, options: opts })) {
@@ -271,8 +359,7 @@ async function runClaudeQuery(prompt) {
                 if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
                     delta += ev.delta.text;
                     fullText = committed + (committed && delta ? '\n' : '') + delta;
-                    sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                    isFirst = false;
+                    emitResponse();
                 }
             } else if (msg.type === 'assistant') {
                 const text = (msg.message?.content || [])
@@ -282,10 +369,7 @@ async function runClaudeQuery(prompt) {
                 if (text) committed = committed ? committed + '\n' + text : text;
                 delta = '';
                 fullText = committed;
-                if (fullText) {
-                    sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                    isFirst = false;
-                }
+                emitResponse(true);
             } else if (msg.type === 'result') {
                 if (msg.session_id) cliSessionId = msg.session_id;
                 if (msg.is_error || (msg.subtype && msg.subtype !== 'success')) {
@@ -295,9 +379,9 @@ async function runClaudeQuery(prompt) {
                 }
                 const final = msg.result || fullText;
                 if (final && final !== fullText) {
-                    sendToRenderer(isFirst ? 'new-response' : 'update-response', final);
                     fullText = final;
                 }
+                emitResponse(true);
             }
         }
     } catch (err) {
@@ -310,6 +394,7 @@ async function runClaudeQuery(prompt) {
         sendToRenderer('update-status', message);
         return { success: false, error: message };
     } finally {
+        if (responseUpdateTimer) clearTimeout(responseUpdateTimer);
         if (activeCliAbort === controller) activeCliAbort = null;
     }
 
@@ -324,7 +409,9 @@ async function streamAnthropicMessages(messages) {
     // claude-opus-4-8 rejects temperature/top_p/top_k — never send sampling params
     const stream = anthropicClient.messages.stream({
         model: claudeModel,
-        max_tokens: 8192,
+        // Keep normal assistant replies bounded. An 8k-token ceiling makes full
+        // responses unnecessarily slow and is excessive for this real-time UI.
+        max_tokens: API_MAX_TOKENS,
         system: currentSystemPrompt || 'You are a helpful assistant.',
         messages,
     });
@@ -364,11 +451,11 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
     try {
         claudeMode = mode === 'api' ? 'api' : 'cli';
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + CLAUDE_CONCISE_RESPONSE_PROMPT;
         claudeConversationHistory = [];
         cliSessionId = null;
 
-        claudeModel = model || 'claude-opus-4-8';
+        claudeModel = model || 'claude-haiku-4-5-20251001';
 
         if (claudeMode === 'cli') {
             const cli = await resolveClaudeCli();
@@ -379,6 +466,13 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
             }
             cliPath = cli.path;
             cliEnv = cli.env;
+
+            // Import once during setup instead of adding module-load latency to
+            // the first user request. Failure is harmless: runClaudeQuery falls
+            // back to the subprocess implementation.
+            await getQueryFn().catch(error => {
+                console.warn('[Claude] SDK preload failed; CLI fallback will be used:', error.message);
+            });
         } else {
             if (!anthropicApiKey || !anthropicApiKey.trim()) {
                 sendToRenderer('session-initializing', false);
@@ -396,10 +490,8 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         }
 
         transcriber.resetTranscriber();
-        transcriber.setOnTranscript(async transcription => {
-            if (!isClaudeActive) return;
-            sendToRenderer('update-status', 'Generating response...');
-            await sendClaudeText(transcription);
+        transcriber.setOnTranscript(transcription => {
+            queueTranscript(transcription);
         });
 
         initializeNewSession(profile, customPrompt);
@@ -436,9 +528,9 @@ async function sendClaudeText(text) {
     console.log('[Claude] Sending text:', trimmed.substring(0, 100) + '...');
 
     if (claudeMode === 'cli') {
-        // Use the subprocess path: --include-partial-messages guarantees token-level
-        // streaming via stdout rather than relying on the SDK's async generator batching.
-        const result = await runClaudeCli(trimmed);
+        // Use the preloaded SDK path so setup is paid during initialization,
+        // while partial messages and the Claude login/session are preserved.
+        const result = await runClaudeQuery(trimmed);
         if (result.success && result.text) {
             saveConversationTurn(trimmed, result.text);
         }
@@ -537,6 +629,12 @@ async function sendClaudeImage(base64Data, prompt) {
 function closeClaudeSession() {
     console.log('[Claude] Closing Claude session');
     isClaudeActive = false;
+    if (transcriptDebounceTimer) {
+        clearTimeout(transcriptDebounceTimer);
+        transcriptDebounceTimer = null;
+    }
+    pendingTranscripts = [];
+    isTranscriptResponseInFlight = false;
     if (activeCliAbort) {
         activeCliAbort.abort();
         activeCliAbort = null;

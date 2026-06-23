@@ -33,6 +33,8 @@ export const unifiedPageStyles = css`
     .page-title {
         font-size: var(--font-size-xl);
         font-weight: var(--font-weight-semibold);
+        line-height: var(--line-height-tight);
+        letter-spacing: var(--tracking-tight);
         color: var(--text-primary);
         margin-bottom: 4px;
     }
@@ -40,6 +42,7 @@ export const unifiedPageStyles = css`
     .page-subtitle {
         color: var(--text-muted);
         font-size: var(--font-size-sm);
+        line-height: var(--line-height-compact);
     }
 
     .surface {
@@ -53,12 +56,15 @@ export const unifiedPageStyles = css`
         color: var(--text-primary);
         font-size: var(--font-size-md);
         font-weight: var(--font-weight-semibold);
+        line-height: var(--line-height-tight);
+        letter-spacing: var(--tracking-tight);
         margin-bottom: 4px;
     }
 
     .surface-subtitle {
         color: var(--text-muted);
         font-size: var(--font-size-xs);
+        line-height: var(--line-height-compact);
         margin-bottom: var(--space-md);
     }
 
@@ -89,6 +95,8 @@ export const unifiedPageStyles = css`
     .form-label {
         color: var(--text-secondary);
         font-size: var(--font-size-sm);
+        font-weight: var(--font-weight-medium);
+        line-height: var(--line-height-compact);
         white-space: nowrap;
         flex-shrink: 0;
     }
@@ -96,7 +104,7 @@ export const unifiedPageStyles = css`
     .form-help {
         color: var(--text-muted);
         font-size: var(--font-size-xs);
-        line-height: 1.4;
+        line-height: var(--line-height-compact);
     }
 
     .control {
@@ -107,6 +115,7 @@ export const unifiedPageStyles = css`
         border-radius: var(--radius-sm);
         padding: 8px 12px;
         font-size: var(--font-size-sm);
+        line-height: var(--line-height-compact);
         transition: border-color var(--transition), box-shadow var(--transition);
     }
 
@@ -134,7 +143,7 @@ export const unifiedPageStyles = css`
         width: 100%;
         min-height: 100px;
         resize: vertical;
-        line-height: 1.45;
+        line-height: var(--line-height);
     }
 
     .chip {

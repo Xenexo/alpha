@@ -29,6 +29,8 @@ export class MainView extends LitElement {
         .page-title {
             font-size: var(--font-size-xl);
             font-weight: var(--font-weight-semibold);
+            line-height: var(--line-height-tight);
+            letter-spacing: var(--tracking-tight);
             color: var(--text-primary);
             margin-bottom: var(--space-xs);
         }
@@ -39,6 +41,7 @@ export class MainView extends LitElement {
 
         .page-subtitle {
             font-size: var(--font-size-sm);
+            line-height: var(--line-height-compact);
             color: var(--text-muted);
             margin-bottom: var(--space-md);
         }
@@ -547,7 +550,7 @@ export class MainView extends LitElement {
         this._whisperModel = 'Xenova/whisper-base';
         this._claudeMode = 'cli';
         this._anthropicKey = '';
-        this._claudeModel = 'claude-opus-4-8';
+        this._claudeModel = 'claude-haiku-4-5-20251001';
         this._claudeModels = null;
         this._claudeModelsLoading = false;
         this._modelFetchTimer = null;
@@ -588,7 +591,7 @@ export class MainView extends LitElement {
 
             // Load Claude settings
             this._claudeMode = prefs.claudeMode || 'cli';
-            this._claudeModel = prefs.claudeModel || 'claude-opus-4-8';
+            this._claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
             this._anthropicKey = creds.anthropicApiKey || '';
 
             this.requestUpdate();

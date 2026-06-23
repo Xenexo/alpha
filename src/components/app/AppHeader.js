@@ -20,7 +20,9 @@ export class AppHeader extends LitElement {
         .header-title {
             flex: 1;
             font-size: var(--header-font-size);
-            font-weight: 500;
+            font-weight: var(--font-weight-semibold);
+            line-height: var(--line-height-tight);
+            letter-spacing: var(--tracking-tight);
             color: var(--text-primary);
             -webkit-app-region: drag;
         }
@@ -34,6 +36,7 @@ export class AppHeader extends LitElement {
 
         .header-actions span {
             font-size: var(--header-font-size-small);
+            line-height: var(--line-height-compact);
             color: var(--text-secondary);
         }
 
@@ -44,7 +47,7 @@ export class AppHeader extends LitElement {
             padding: var(--header-button-padding);
             border-radius: 3px;
             font-size: var(--header-font-size-small);
-            font-weight: 500;
+            font-weight: var(--font-weight-medium);
             transition: background 0.1s ease;
         }
 
@@ -59,7 +62,7 @@ export class AppHeader extends LitElement {
             padding: var(--header-icon-padding);
             border-radius: 3px;
             font-size: var(--header-font-size-small);
-            font-weight: 500;
+            font-weight: var(--font-weight-medium);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -85,12 +88,12 @@ export class AppHeader extends LitElement {
             background: var(--key-background);
             padding: 2px 6px;
             border-radius: 3px;
-            font-size: 11px;
+            font-size: var(--font-size-xs);
             font-family: var(--font-mono);
         }
 
         .click-through-indicator {
-            font-size: 10px;
+            font-size: var(--font-size-xs);
             color: var(--text-muted);
             background: var(--key-background);
             padding: 2px 6px;
@@ -105,7 +108,7 @@ export class AppHeader extends LitElement {
             padding: var(--header-button-padding);
             border-radius: 3px;
             font-size: var(--header-font-size-small);
-            font-weight: 500;
+            font-weight: var(--font-weight-medium);
             display: flex;
             align-items: center;
             gap: 4px;

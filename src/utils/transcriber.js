@@ -7,6 +7,9 @@ const { sendToRenderer } = require('./gemini');
 let whisperPipeline = null;
 let isWhisperLoading = false;
 let onTranscript = null;
+let isTranscribing = false;
+let pendingAudioJob = null;
+let transcriptionGeneration = 0;
 
 // VAD state
 let isSpeaking = false;
@@ -95,7 +98,7 @@ function processVAD(pcm16kBuffer) {
             // Trigger transcription with accumulated audio
             const audioData = Buffer.concat(speechBuffers);
             speechBuffers = [];
-            handleSpeechEnd(audioData);
+            queueTranscription(audioData);
             return;
         }
     }
@@ -177,7 +180,7 @@ async function transcribeAudio(pcm16kBuffer) {
 
 // ── Speech End Handler ──
 
-async function handleSpeechEnd(audioData) {
+async function handleSpeechEnd(audioData, generation) {
     if (!onTranscript) return;
 
     // Minimum audio length check (~0.5 seconds at 16kHz, 16-bit)
@@ -189,6 +192,9 @@ async function handleSpeechEnd(audioData) {
 
     const transcription = await transcribeAudio(audioData);
 
+    // The session may have been reset while Whisper was running.
+    if (generation !== transcriptionGeneration) return;
+
     if (!transcription || transcription.trim() === '' || transcription.trim().length < 2) {
         console.log('[Transcriber] Empty transcription, skipping');
         sendToRenderer('update-status', 'Listening...');
@@ -197,6 +203,36 @@ async function handleSpeechEnd(audioData) {
 
     if (onTranscript) {
         await onTranscript(transcription);
+    }
+}
+
+async function queueTranscription(audioData) {
+    // Whisper inference is expensive. Never run overlapping inference jobs;
+    // when speech arrives faster than it can be processed, retain only the
+    // newest segment instead of building an increasingly stale backlog.
+    if (isTranscribing) {
+        pendingAudioJob = { audioData, generation: transcriptionGeneration };
+        return;
+    }
+
+    isTranscribing = true;
+    let job = { audioData, generation: transcriptionGeneration };
+
+    try {
+        while (job) {
+            pendingAudioJob = null;
+            if (job.generation === transcriptionGeneration) {
+                await handleSpeechEnd(job.audioData, job.generation);
+            }
+            job = pendingAudioJob;
+        }
+    } finally {
+        isTranscribing = false;
+        const queuedJob = pendingAudioJob;
+        pendingAudioJob = null;
+        if (queuedJob && queuedJob.generation === transcriptionGeneration) {
+            queueTranscription(queuedJob.audioData);
+        }
     }
 }
 
@@ -219,11 +255,13 @@ function processAudio24k(monoChunk24k) {
 }
 
 function resetTranscriber() {
+    transcriptionGeneration++;
     isSpeaking = false;
     speechBuffers = [];
     silenceFrameCount = 0;
     speechFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
+    pendingAudioJob = null;
     onTranscript = null;
     // Note: whisperPipeline is kept loaded to avoid reloading on next session
 }

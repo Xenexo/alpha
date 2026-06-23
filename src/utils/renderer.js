@@ -174,7 +174,7 @@ async function initializeClaude(profile = 'interview') {
     const prefs = await storage.getPreferences();
     const creds = await storage.getCredentials();
     const claudeMode = prefs.claudeMode || 'cli';
-    const claudeModel = prefs.claudeModel || 'claude-opus-4-8';
+    const claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
     const whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
     const customPrompt = prefs.customPrompt || '';
 

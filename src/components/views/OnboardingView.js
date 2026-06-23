@@ -69,15 +69,16 @@ export class OnboardingView extends LitElement {
         }
 
         .slide-title {
-            font-size: 28px;
-            font-weight: 600;
+            font-size: var(--font-size-2xl);
+            font-weight: var(--font-weight-semibold);
             color: #111111;
-            line-height: 1.2;
+            line-height: var(--line-height-tight);
+            letter-spacing: var(--tracking-tight);
         }
 
         .slide-text {
-            font-size: 13px;
-            line-height: 1.5;
+            font-size: var(--font-size-sm);
+            line-height: var(--line-height);
             color: #666666;
         }
 
@@ -90,9 +91,9 @@ export class OnboardingView extends LitElement {
             background: rgba(255, 255, 255, 0.7);
             backdrop-filter: blur(8px);
             color: #111111;
-            font-size: 13px;
+            font-size: var(--font-size-sm);
             font-family: var(--font);
-            line-height: 1.5;
+            line-height: var(--line-height);
             resize: vertical;
             text-align: left;
         }
@@ -120,8 +121,8 @@ export class OnboardingView extends LitElement {
             color: #ffffff;
             padding: 10px 32px;
             border-radius: 8px;
-            font-size: 13px;
-            font-weight: 500;
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-medium);
             cursor: pointer;
             transition: opacity 0.15s;
         }
@@ -134,7 +135,7 @@ export class OnboardingView extends LitElement {
             background: none;
             border: none;
             color: #888888;
-            font-size: 11px;
+            font-size: var(--font-size-xs);
             cursor: pointer;
             padding: 4px 8px;
         }

@@ -33,7 +33,8 @@ const DEFAULT_PREFERENCES = {
     ollamaModel: 'llama3.1',
     whisperModel: 'Xenova/whisper-base',
     claudeMode: 'cli',
-    claudeModel: 'claude-opus-4-8',
+    claudeModel: 'claude-haiku-4-5-20251001',
+    claudeFastDefaultApplied: true,
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
@@ -220,6 +221,18 @@ function setAnthropicApiKey(anthropicApiKey) {
 
 function getPreferences() {
     const saved = readJsonFile(getPreferencesPath(), {});
+
+    // One-time migration for installations created when Opus was the default.
+    // After this marker is stored, users can explicitly switch back to Opus
+    // without the preference being overwritten again.
+    if (!Object.prototype.hasOwnProperty.call(saved, 'claudeFastDefaultApplied')) {
+        if (!saved.claudeModel || saved.claudeModel === 'claude-opus-4-8') {
+            saved.claudeModel = DEFAULT_PREFERENCES.claudeModel;
+        }
+        saved.claudeFastDefaultApplied = true;
+        writeJsonFile(getPreferencesPath(), saved);
+    }
+
     return { ...DEFAULT_PREFERENCES, ...saved };
 }
 
