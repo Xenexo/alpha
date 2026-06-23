@@ -56,13 +56,17 @@ export class MainView extends LitElement {
             border: 1px solid rgba(59, 130, 246, 0.45);
             background: linear-gradient(135deg, rgba(59, 130, 246, 0.12) 0%, rgba(139, 92, 246, 0.09) 100%);
             cursor: pointer;
-            transition: border-color 0.2s, background 0.2s;
+            transition:
+                border-color 0.2s,
+                background 0.2s;
         }
 
         .cloud-promo:hover {
             border-color: rgba(59, 130, 246, 0.65);
             background: linear-gradient(135deg, rgba(59, 130, 246, 0.16) 0%, rgba(139, 92, 246, 0.12) 100%);
-            box-shadow: 0 0 20px rgba(59, 130, 246, 0.15), 0 0 40px rgba(139, 92, 246, 0.08);
+            box-shadow:
+                0 0 20px rgba(59, 130, 246, 0.15),
+                0 0 40px rgba(139, 92, 246, 0.08);
         }
 
         .cloud-promo-glow {
@@ -119,7 +123,9 @@ export class MainView extends LitElement {
             letter-spacing: 0.5px;
         }
 
-        input, select, textarea {
+        input,
+        select,
+        textarea {
             background: var(--bg-elevated);
             color: var(--text-primary);
             border: 1px solid var(--border);
@@ -128,25 +134,32 @@ export class MainView extends LitElement {
             border-radius: var(--radius-sm);
             font-size: var(--font-size-sm);
             font-family: var(--font);
-            transition: border-color var(--transition), box-shadow var(--transition);
+            transition:
+                border-color var(--transition),
+                box-shadow var(--transition);
         }
 
-        input:hover:not(:focus), select:hover:not(:focus), textarea:hover:not(:focus) {
+        input:hover:not(:focus),
+        select:hover:not(:focus),
+        textarea:hover:not(:focus) {
             border-color: var(--text-muted);
         }
 
-        input:focus, select:focus, textarea:focus {
+        input:focus,
+        select:focus,
+        textarea:focus {
             outline: none;
             border-color: var(--accent);
             box-shadow: 0 0 0 1px var(--accent);
         }
 
-        input::placeholder, textarea::placeholder {
+        input::placeholder,
+        textarea::placeholder {
             color: var(--text-muted);
         }
 
         input.error {
-            border-color: var(--danger, #EF4444);
+            border-color: var(--danger, #ef4444);
         }
 
         select {
@@ -170,7 +183,8 @@ export class MainView extends LitElement {
             color: var(--text-muted);
         }
 
-        .form-hint a, .form-hint span.link {
+        .form-hint a,
+        .form-hint span.link {
             color: var(--accent);
             text-decoration: none;
             cursor: pointer;
@@ -196,7 +210,9 @@ export class MainView extends LitElement {
         }
 
         @keyframes whisper-spin {
-            to { transform: rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         /* ── Start button ── */
@@ -328,7 +344,9 @@ export class MainView extends LitElement {
             border: 1px solid var(--border);
             background: var(--bg-elevated);
             cursor: pointer;
-            transition: border-color 0.2s, background 0.2s;
+            transition:
+                border-color 0.2s,
+                background 0.2s;
         }
 
         .mode-card:hover {
@@ -499,6 +517,12 @@ export class MainView extends LitElement {
         _ollamaModel: { state: true },
         _whisperModel: { state: true },
         _showLocalHelp: { state: true },
+        // Claude state
+        _claudeMode: { state: true },
+        _anthropicKey: { state: true },
+        _claudeModel: { state: true },
+        _claudeModels: { state: true },
+        _claudeModelsLoading: { state: true },
     };
 
     constructor() {
@@ -520,7 +544,13 @@ export class MainView extends LitElement {
         this._showLocalHelp = false;
         this._ollamaHost = 'http://127.0.0.1:11434';
         this._ollamaModel = 'llama3.1';
-        this._whisperModel = 'Xenova/whisper-small';
+        this._whisperModel = 'Xenova/whisper-base';
+        this._claudeMode = 'cli';
+        this._anthropicKey = '';
+        this._claudeModel = 'claude-opus-4-8';
+        this._claudeModels = null;
+        this._claudeModelsLoading = false;
+        this._modelFetchTimer = null;
 
         this._animId = null;
         this._time = 0;
@@ -547,14 +577,19 @@ export class MainView extends LitElement {
 
             // Load keys
             this._token = creds.cloudToken || '';
-            this._geminiKey = await cheatingDaddy.storage.getApiKey().catch(() => '') || '';
-            this._groqKey = await cheatingDaddy.storage.getGroqApiKey().catch(() => '') || '';
+            this._geminiKey = (await cheatingDaddy.storage.getApiKey().catch(() => '')) || '';
+            this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
             this._openaiKey = creds.openaiKey || '';
 
             // Load local AI settings
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
-            this._whisperModel = prefs.whisperModel || 'Xenova/whisper-small';
+            this._whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
+
+            // Load Claude settings
+            this._claudeMode = prefs.claudeMode || 'cli';
+            this._claudeModel = prefs.claudeModel || 'claude-opus-4-8';
+            this._anthropicKey = creds.anthropicApiKey || '';
 
             this.requestUpdate();
         } catch (e) {
@@ -593,7 +628,7 @@ export class MainView extends LitElement {
         // Mouse tracking
         this._mouseX = -1;
         this._mouseY = -1;
-        btn.addEventListener('mousemove', (e) => {
+        btn.addEventListener('mousemove', e => {
             const rect = btn.getBoundingClientRect();
             this._mouseX = (e.clientX - rect.left) / rect.width;
             this._mouseY = (e.clientY - rect.top) / rect.height;
@@ -613,7 +648,10 @@ export class MainView extends LitElement {
         const img = dCtx.createImageData(cols, rows);
         for (let i = 0; i < img.data.length; i += 4) {
             const v = Math.random() > 0.5 ? 255 : 0;
-            img.data[i] = v; img.data[i+1] = v; img.data[i+2] = v; img.data[i+3] = 255;
+            img.data[i] = v;
+            img.data[i + 1] = v;
+            img.data[i + 2] = v;
+            img.data[i + 3] = 255;
         }
         dCtx.putImageData(img, 0, 0);
 
@@ -743,6 +781,64 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveClaudeMode(val) {
+        this._claudeMode = val;
+        this._keyError = false;
+        await cheatingDaddy.storage.updatePreference('claudeMode', val);
+        if (val === 'api') this._scheduleFetchClaudeModels(this._anthropicKey);
+        else {
+            this._claudeModels = null;
+            this._claudeModelsLoading = false;
+        }
+        this.requestUpdate();
+    }
+
+    async _saveClaudeModel(val) {
+        this._claudeModel = val;
+        await cheatingDaddy.storage.updatePreference('claudeModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveAnthropicKey(val) {
+        this._anthropicKey = val;
+        this._keyError = false;
+        try {
+            const creds = await cheatingDaddy.storage.getCredentials().catch(() => ({}));
+            await cheatingDaddy.storage.setCredentials({ ...creds, anthropicApiKey: val });
+        } catch (e) {}
+        if (this._claudeMode === 'api') this._scheduleFetchClaudeModels(val);
+        this.requestUpdate();
+    }
+
+    _scheduleFetchClaudeModels(apiKey) {
+        clearTimeout(this._modelFetchTimer);
+        if (!apiKey || apiKey.trim().length < 20) {
+            this._claudeModels = null;
+            this.requestUpdate();
+            return;
+        }
+        this._claudeModelsLoading = true;
+        this.requestUpdate();
+        this._modelFetchTimer = setTimeout(() => this._fetchClaudeModels(apiKey), 700);
+    }
+
+    async _fetchClaudeModels(apiKey) {
+        try {
+            const { ipcRenderer } = window.require('electron');
+            const models = await ipcRenderer.invoke('list-claude-models', apiKey);
+            this._claudeModels = models;
+            if (models && models.length && !models.find(m => m.id === this._claudeModel)) {
+                this._claudeModel = models[0].id;
+                await cheatingDaddy.storage.updatePreference('claudeModel', this._claudeModel);
+            }
+        } catch (e) {
+            this._claudeModels = null;
+        } finally {
+            this._claudeModelsLoading = false;
+            this.requestUpdate();
+        }
+    }
+
     _handleProfileChange(e) {
         this.onProfileChange(e.target.value);
     }
@@ -763,13 +859,20 @@ export class MainView extends LitElement {
             if (!this._ollamaHost.trim()) {
                 return;
             }
+        } else if (this._mode === 'claude') {
+            // CLI mode uses the local Claude Code login; API mode needs a key
+            if (this._claudeMode === 'api' && !this._anthropicKey.trim()) {
+                this._keyError = true;
+                this.requestUpdate();
+                return;
+            }
         }
 
         this.onStart();
     }
 
     triggerApiKeyError() {
-        this._keyError = this._mode !== 'local';
+        this._keyError = this._mode === 'byok' || (this._mode === 'claude' && this._claudeMode === 'api');
         this.requestUpdate();
         setTimeout(() => {
             this._tokenError = false;
@@ -783,15 +886,51 @@ export class MainView extends LitElement {
     _renderStartButton() {
         const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
 
-        const cmdIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/></svg>`;
-        const ctrlIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>`;
-        const enterIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 10l-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`;
+        const cmdIcon = html`<svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+        >
+            <path
+                d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"
+            />
+        </svg>`;
+        const ctrlIcon = html`<svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+        >
+            <path d="M6 15l6-6 6 6" />
+        </svg>`;
+        const enterIcon = html`<svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+        >
+            <path d="M9 10l-5 5 5 5" />
+            <path d="M20 4v7a4 4 0 0 1-4 4H4" />
+        </svg>`;
 
         return html`
-            <button
-                class="start-button ${this.isInitializing ? 'disabled' : ''}"
-                @click=${() => this._handleStart()}
-            >
+            <button class="start-button ${this.isInitializing ? 'disabled' : ''}" @click=${() => this._handleStart()}>
                 <canvas class="btn-aurora"></canvas>
                 <canvas class="btn-dither"></canvas>
                 <span class="btn-label">
@@ -836,26 +975,139 @@ export class MainView extends LitElement {
 
             <div class="form-group">
                 <label class="form-label">Groq API Key</label>
-                <input
-                    type="password"
-                    placeholder="Optional"
-                    .value=${this._groqKey}
-                    @input=${e => this._saveGroqKey(e.target.value)}
-                />
+                <input type="password" placeholder="Optional" .value=${this._groqKey} @input=${e => this._saveGroqKey(e.target.value)} />
                 <div class="form-hint">
                     <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
                 </div>
             </div>
 
-            ${this._renderStartButton()}
-            ${this._renderDivider()}
+            ${this._renderStartButton()} ${this._renderDivider()}
 
             <!-- Cloud promo intentionally removed from the active UI. -->
 
             <div class="mode-links">
                 <button class="mode-link" @click=${() => this._saveMode('local')}>Use local AI</button>
+                <button class="mode-link" @click=${() => this._saveMode('claude')}>Use Claude</button>
             </div>
         `;
+    }
+
+    // ── Shared Whisper model select ──
+
+    _renderWhisperSelect() {
+        return html`
+            <div class="form-group">
+                <div class="whisper-label-row">
+                    <label class="form-label">Whisper Model</label>
+                    ${this.whisperDownloading ? html`<div class="whisper-spinner"></div>` : ''}
+                </div>
+                <select .value=${this._whisperModel} @change=${e => this._saveWhisperModel(e.target.value)}>
+                    <option value="Xenova/whisper-tiny" ?selected=${this._whisperModel === 'Xenova/whisper-tiny'}>
+                        Tiny (fastest, least accurate)
+                    </option>
+                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>Base (recommended)</option>
+                    <option value="Xenova/whisper-small" ?selected=${this._whisperModel === 'Xenova/whisper-small'}>
+                        Small (unstable — crashes on some Macs)
+                    </option>
+                    <option value="Xenova/whisper-medium" ?selected=${this._whisperModel === 'Xenova/whisper-medium'}>
+                        Medium (unstable — crashes on some Macs)
+                    </option>
+                </select>
+                <div class="form-hint">
+                    ${this.whisperDownloading ? 'Downloading model...' : 'Used for speech-to-text, downloaded automatically on first use'}
+                </div>
+            </div>
+        `;
+    }
+
+    // ── Claude mode ──
+
+    _renderClaudeMode() {
+        return html`
+            <div class="mode-cards">
+                <div
+                    class="mode-card"
+                    style=${this._claudeMode === 'cli' ? 'border-color: var(--accent);' : ''}
+                    @click=${() => this._saveClaudeMode('cli')}
+                >
+                    <div class="mode-card-title">Claude Code CLI</div>
+                    <div class="mode-card-desc">No API key — uses your claude.ai subscription login</div>
+                </div>
+                <div
+                    class="mode-card"
+                    style=${this._claudeMode === 'api' ? 'border-color: var(--accent);' : ''}
+                    @click=${() => this._saveClaudeMode('api')}
+                >
+                    <div class="mode-card-title">Anthropic API</div>
+                    <div class="mode-card-desc">Bring your own Anthropic API key</div>
+                </div>
+            </div>
+
+            ${this._claudeMode === 'api'
+                ? html`
+                      <div class="form-group">
+                          <label class="form-label">Anthropic API Key</label>
+                          <input
+                              type="password"
+                              placeholder="Required"
+                              .value=${this._anthropicKey}
+                              @input=${e => this._saveAnthropicKey(e.target.value)}
+                              class=${this._keyError ? 'error' : ''}
+                          />
+                          <div class="form-hint">
+                              <span class="link" @click=${() => this.onExternalLink('https://console.anthropic.com/settings/keys')}
+                                  >Get Anthropic key</span
+                              >
+                          </div>
+                      </div>
+                  `
+                : html`
+                      <div class="form-hint">
+                          Uses the locally installed
+                          <code
+                              style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
+                              >claude</code
+                          >
+                          CLI with your existing claude.ai login. Install Claude Code and run
+                          <code
+                              style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
+                              >claude</code
+                          >
+                          once in a terminal to sign in.
+                      </div>
+                  `}
+
+            <div class="form-group">
+                <label class="form-label"
+                    >Claude Model${this._claudeModelsLoading ? html`&nbsp;<span style="font-size:10px;opacity:0.5">loading...</span>` : ''}</label
+                >
+                <select .value=${this._claudeModel} @change=${e => this._saveClaudeModel(e.target.value)} ?disabled=${this._claudeModelsLoading}>
+                    ${this._renderClaudeModelOptions()}
+                </select>
+            </div>
+
+            ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
+
+            <div class="mode-links">
+                <button class="mode-link" @click=${() => this._saveMode('byok')}>Use own API keys</button>
+                <button class="mode-link" @click=${() => this._saveMode('local')}>Use local AI</button>
+            </div>
+        `;
+    }
+
+    _renderClaudeModelOptions() {
+        const fallback = [
+            { id: 'claude-opus-4-8', name: 'Opus 4.8 (most capable)' },
+            { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6 (fast + smart)' },
+            { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5 (fastest)' },
+        ];
+        const models = this._claudeModels && this._claudeModels.length ? this._claudeModels : fallback;
+        const currentId = this._claudeModel;
+        const options = [...models];
+        if (currentId && !options.find(m => m.id === currentId)) {
+            options.unshift({ id: currentId, name: currentId });
+        }
+        return options.map(m => html`<option value=${m.id} ?selected=${this._claudeModel === m.id}>${m.name}</option>`);
     }
 
     // ── Local AI mode ──
@@ -875,39 +1127,24 @@ export class MainView extends LitElement {
 
             <div class="form-group">
                 <label class="form-label">Ollama Model</label>
-                <input
-                    type="text"
-                    placeholder="llama3.1"
-                    .value=${this._ollamaModel}
-                    @input=${e => this._saveOllamaModel(e.target.value)}
-                />
-                <div class="form-hint">Run <code style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;">ollama pull ${this._ollamaModel}</code> first</div>
-            </div>
-
-            <div class="form-group">
-                <div class="whisper-label-row">
-                    <label class="form-label">Whisper Model</label>
-                    ${this.whisperDownloading ? html`<div class="whisper-spinner"></div>` : ''}
+                <input type="text" placeholder="llama3.1" .value=${this._ollamaModel} @input=${e => this._saveOllamaModel(e.target.value)} />
+                <div class="form-hint">
+                    Run
+                    <code
+                        style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
+                        >ollama pull ${this._ollamaModel}</code
+                    >
+                    first
                 </div>
-                <select
-                    .value=${this._whisperModel}
-                    @change=${e => this._saveWhisperModel(e.target.value)}
-                >
-                    <option value="Xenova/whisper-tiny" ?selected=${this._whisperModel === 'Xenova/whisper-tiny'}>Tiny (fastest, least accurate)</option>
-                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>Base</option>
-                    <option value="Xenova/whisper-small" ?selected=${this._whisperModel === 'Xenova/whisper-small'}>Small (recommended)</option>
-                    <option value="Xenova/whisper-medium" ?selected=${this._whisperModel === 'Xenova/whisper-medium'}>Medium (most accurate, slowest)</option>
-                </select>
-                <div class="form-hint">${this.whisperDownloading ? 'Downloading model...' : 'Downloaded automatically on first use'}</div>
             </div>
 
-            ${this._renderStartButton()}
-            ${this._renderDivider()}
+            ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
 
             <!-- Cloud promo intentionally removed from the active UI. -->
 
             <div class="mode-links">
                 <button class="mode-link" @click=${() => this._saveMode('byok')}>Use own API keys</button>
+                <button class="mode-link" @click=${() => this._saveMode('claude')}>Use Claude</button>
             </div>
         `;
     }
@@ -915,27 +1152,45 @@ export class MainView extends LitElement {
     // ── Main render ──
 
     render() {
-        const helpIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0m9 5v.01" /><path d="M12 13.5a1.5 1.5 0 0 1 1-1.5a2.6 2.6 0 1 0-3-4" /></g></svg>`;
-        const closeIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6L6 18M6 6l12 12" /></svg>`;
+        const helpIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+                <path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0m9 5v.01" />
+                <path d="M12 13.5a1.5 1.5 0 0 1 1-1.5a2.6 2.6 0 1 0-3-4" />
+            </g>
+        </svg>`;
+        const closeIcon = html`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6L6 18M6 6l12 12" />
+        </svg>`;
 
         return html`
             <div class="form-wrapper">
-                ${this._mode === 'local' ? html`
-                    <div class="title-row">
-                        <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
-                        <button class="help-btn" @click=${() => { this._showLocalHelp = !this._showLocalHelp; }}>${this._showLocalHelp ? closeIcon : helpIcon}</button>
-                    </div>
-                ` : html`
-                    <div class="page-title">
-                        ${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}
-                    </div>
-                `}
+                ${this._mode === 'local'
+                    ? html`
+                          <div class="title-row">
+                              <div class="page-title">alpha <span class="mode-suffix">Local AI</span></div>
+                              <button
+                                  class="help-btn"
+                                  @click=${() => {
+                                      this._showLocalHelp = !this._showLocalHelp;
+                                  }}
+                              >
+                                  ${this._showLocalHelp ? closeIcon : helpIcon}
+                              </button>
+                          </div>
+                      `
+                    : html`
+                          <div class="page-title">${html`alpha <span class="mode-suffix">${this._mode === 'claude' ? 'Claude' : 'BYOK'}</span>`}</div>
+                      `}
                 <div class="page-subtitle">
-                    ${this._mode === 'byok' ? 'Bring your own API keys' : 'Run models locally on your machine'}
+                    ${this._mode === 'byok'
+                        ? 'Bring your own API keys'
+                        : this._mode === 'claude'
+                          ? 'Powered by Claude — via Claude Code or API key'
+                          : 'Run models locally on your machine'}
                 </div>
 
                 <!-- Cloud mode render branch intentionally disabled. -->
-                ${this._mode === 'byok' ? this._renderByokMode() : ''}
+                ${this._mode === 'byok' ? this._renderByokMode() : ''} ${this._mode === 'claude' ? this._renderClaudeMode() : ''}
                 ${this._mode === 'local' ? (this._showLocalHelp ? this._renderLocalHelp() : this._renderLocalMode()) : ''}
             </div>
         `;
@@ -946,17 +1201,26 @@ export class MainView extends LitElement {
             <div class="help-content">
                 <div class="help-section">
                     <div class="help-section-title">What is Ollama?</div>
-                    <div class="help-section-text">Ollama lets you run large language models locally on your machine. Everything stays on your computer — no data leaves your device.</div>
+                    <div class="help-section-text">
+                        Ollama lets you run large language models locally on your machine. Everything stays on your computer — no data leaves your
+                        device.
+                    </div>
                 </div>
 
                 <div class="help-section">
                     <div class="help-section-title">Install Ollama</div>
-                    <div class="help-section-text">Download from <span class="help-link" @click=${() => this.onExternalLink('https://ollama.com/download')}>ollama.com/download</span> and install it.</div>
+                    <div class="help-section-text">
+                        Download from
+                        <span class="help-link" @click=${() => this.onExternalLink('https://ollama.com/download')}>ollama.com/download</span> and
+                        install it.
+                    </div>
                 </div>
 
                 <div class="help-section">
                     <div class="help-section-title">Ollama must be running</div>
-                    <div class="help-section-text">Ollama needs to be running before you start a session. If it's not running, open your terminal and type:</div>
+                    <div class="help-section-text">
+                        Ollama needs to be running before you start a session. If it's not running, open your terminal and type:
+                    </div>
                     <code class="help-code">ollama serve</code>
                 </div>
 
@@ -976,22 +1240,38 @@ export class MainView extends LitElement {
                 </div>
 
                 <div class="help-section">
-                    <div class="help-warn">Avoid "thinking" models (e.g. deepseek-r1, qwq). Local inference is already slower — a thinking model adds extra delay before responding.</div>
+                    <div class="help-warn">
+                        Avoid "thinking" models (e.g. deepseek-r1, qwq). Local inference is already slower — a thinking model adds extra delay before
+                        responding.
+                    </div>
                 </div>
 
                 <div class="help-section">
                     <div class="help-section-title">Whisper</div>
-                    <div class="help-section-text">The Whisper speech-to-text model is downloaded automatically the first time you start a session. This is a one-time download.</div>
+                    <div class="help-section-text">
+                        The Whisper speech-to-text model is downloaded automatically the first time you start a session. This is a one-time download.
+                    </div>
                 </div>
 
                 <hr class="help-divider" />
 
                 <div class="help-section">
                     <div class="help-section-title">Computer hanging or slow?</div>
-                    <div class="help-section-text">Running models locally uses a lot of RAM and CPU. If your computer slows down or freezes, it's likely the LLM. Switch back to BYOK mode if you want to use a hosted provider instead.</div>
+                    <div class="help-section-text">
+                        Running models locally uses a lot of RAM and CPU. If your computer slows down or freezes, it's likely the LLM. Switch back to
+                        BYOK mode if you want to use a hosted provider instead.
+                    </div>
                 </div>
 
-                <button class="help-cloud-btn" @click=${() => { this._showLocalHelp = false; this._saveMode('byok'); }}>Switch to BYOK</button>
+                <button
+                    class="help-cloud-btn"
+                    @click=${() => {
+                        this._showLocalHelp = false;
+                        this._saveMode('byok');
+                    }}
+                >
+                    Switch to BYOK
+                </button>
             </div>
         `;
     }

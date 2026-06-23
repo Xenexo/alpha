@@ -106,7 +106,7 @@ const storage = {
     async getTodayLimits() {
         const result = await ipcRenderer.invoke('storage:get-today-limits');
         return result.success ? result.data : { flash: { count: 0 }, flashLite: { count: 0 } };
-    }
+    },
 };
 
 // Cache for preferences to avoid async calls in hot paths
@@ -157,12 +157,38 @@ async function initializeLocal(profile = 'interview') {
     const prefs = await storage.getPreferences();
     const ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
     const ollamaModel = prefs.ollamaModel || 'llama3.1';
-    const whisperModel = prefs.whisperModel || 'Xenova/whisper-small';
+    const whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
     const customPrompt = prefs.customPrompt || '';
 
     const success = await ipcRenderer.invoke('initialize-local', ollamaHost, ollamaModel, whisperModel, profile, customPrompt);
     if (success) {
         cheatingDaddy.setStatus('Local AI Live');
+        return true;
+    } else {
+        cheatingDaddy.setStatus('error');
+        return false;
+    }
+}
+
+async function initializeClaude(profile = 'interview') {
+    const prefs = await storage.getPreferences();
+    const creds = await storage.getCredentials();
+    const claudeMode = prefs.claudeMode || 'cli';
+    const claudeModel = prefs.claudeModel || 'claude-opus-4-8';
+    const whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
+    const customPrompt = prefs.customPrompt || '';
+
+    const success = await ipcRenderer.invoke(
+        'initialize-claude',
+        claudeMode,
+        creds.anthropicApiKey || '',
+        claudeModel,
+        whisperModel,
+        profile,
+        customPrompt
+    );
+    if (success) {
+        cheatingDaddy.setStatus('Claude Live');
         return true;
     } else {
         cheatingDaddy.setStatus('error');
@@ -198,6 +224,7 @@ ipcRenderer.on('update-status', (event, status) => {
 async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'medium') {
     // Store the image quality for manual screenshots
     currentImageQuality = imageQuality;
+    ipcRenderer.send('session-state-changed', true);
 
     // Refresh preferences cache
     await loadPreferencesCache();
@@ -361,7 +388,13 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
         console.log('Manual mode enabled - screenshots will be captured on demand only');
     } catch (err) {
         console.error('Error starting capture:', err);
-        cheatingDaddy.setStatus('error');
+        // On macOS a denied Screen Recording permission rejects getDisplayMedia
+        // with NotAllowedError. Tell the user the actual cause instead of a bare "error".
+        if (err && (err.name === 'NotAllowedError' || /permission|denied/i.test(err.message || ''))) {
+            cheatingDaddy.setStatus('Screen Recording permission required — enable it in System Settings, then restart the app.');
+        } else {
+            cheatingDaddy.setStatus('error');
+        }
     }
 }
 
@@ -662,6 +695,8 @@ async function captureManualScreenshot(imageQuality = null) {
 window.captureManualScreenshot = captureManualScreenshot;
 
 function stopCapture() {
+    ipcRenderer.send('session-state-changed', false);
+
     if (screenshotInterval) {
         clearInterval(screenshotInterval);
         screenshotInterval = null;
@@ -741,7 +776,7 @@ ipcRenderer.on('save-session-context', async (event, data) => {
     try {
         await storage.saveSession(data.sessionId, {
             profile: data.profile,
-            customPrompt: data.customPrompt
+            customPrompt: data.customPrompt,
         });
         console.log('Session context saved:', data.sessionId, 'profile:', data.profile);
     } catch (error) {
@@ -755,7 +790,7 @@ ipcRenderer.on('save-screen-analysis', async (event, data) => {
         await storage.saveSession(data.sessionId, {
             screenAnalysisHistory: data.fullHistory,
             profile: data.profile,
-            customPrompt: data.customPrompt
+            customPrompt: data.customPrompt,
         });
         console.log('Screen analysis saved:', data.sessionId);
     } catch (error) {
@@ -779,86 +814,162 @@ function handleShortcut(shortcutKey) {
         } else {
             captureManualScreenshot();
         }
+    } else if (shortcutKey === 'analyze-screen') {
+        // Dedicated analyze-screen shortcut: works from any view during a session
+        if (!mediaStream) {
+            cheatingDaddy.setStatus('Start a session first');
+            return;
+        }
+        if (currentView !== 'assistant') {
+            cheatingDaddy.element().currentView = 'assistant';
+        }
+        captureManualScreenshot();
     }
 }
 
+// Selected text captured by the global shortcut (main process simulates copy)
+ipcRenderer.on('selection-captured', async (event, text) => {
+    console.log('Selection captured:', text.substring(0, 100));
+    if (cheatingDaddy.getCurrentView() !== 'assistant') {
+        cheatingDaddy.element().currentView = 'assistant';
+    }
+    const result = await sendTextMessage(`Explain/answer this:\n\n${text}`);
+    if (!result.success) {
+        cheatingDaddy.setStatus(result.error || 'No active session — start one first');
+    }
+});
+
 // Create reference to the main app element
-const cheatingDaddyApp = document.querySelector('cheating-daddy-app');
+const cheatingDaddyApp = document.querySelector('help-guru-app');
 
 // ============ THEME SYSTEM ============
 const theme = {
     themes: {
         dark: {
             background: '#101010',
-            text: '#e0e0e0', textSecondary: '#a0a0a0', textMuted: '#6b6b6b',
-            border: '#2a2a2a', accent: '#ffffff',
-            btnPrimaryBg: '#ffffff', btnPrimaryText: '#000000', btnPrimaryHover: '#e0e0e0',
-            tooltipBg: '#1a1a1a', tooltipText: '#ffffff',
-            keyBg: 'rgba(255,255,255,0.1)'
+            text: '#e0e0e0',
+            textSecondary: '#a0a0a0',
+            textMuted: '#6b6b6b',
+            border: '#2a2a2a',
+            accent: '#ffffff',
+            btnPrimaryBg: '#ffffff',
+            btnPrimaryText: '#000000',
+            btnPrimaryHover: '#e0e0e0',
+            tooltipBg: '#1a1a1a',
+            tooltipText: '#ffffff',
+            keyBg: 'rgba(255,255,255,0.1)',
         },
         light: {
             background: '#ffffff',
-            text: '#1a1a1a', textSecondary: '#555555', textMuted: '#888888',
-            border: '#e0e0e0', accent: '#000000',
-            btnPrimaryBg: '#1a1a1a', btnPrimaryText: '#ffffff', btnPrimaryHover: '#333333',
-            tooltipBg: '#1a1a1a', tooltipText: '#ffffff',
-            keyBg: 'rgba(0,0,0,0.1)'
+            text: '#1a1a1a',
+            textSecondary: '#555555',
+            textMuted: '#888888',
+            border: '#e0e0e0',
+            accent: '#000000',
+            btnPrimaryBg: '#1a1a1a',
+            btnPrimaryText: '#ffffff',
+            btnPrimaryHover: '#333333',
+            tooltipBg: '#1a1a1a',
+            tooltipText: '#ffffff',
+            keyBg: 'rgba(0,0,0,0.1)',
         },
         midnight: {
             background: '#0d1117',
-            text: '#c9d1d9', textSecondary: '#8b949e', textMuted: '#6e7681',
-            border: '#30363d', accent: '#58a6ff',
-            btnPrimaryBg: '#58a6ff', btnPrimaryText: '#0d1117', btnPrimaryHover: '#79b8ff',
-            tooltipBg: '#161b22', tooltipText: '#c9d1d9',
-            keyBg: 'rgba(88,166,255,0.15)'
+            text: '#c9d1d9',
+            textSecondary: '#8b949e',
+            textMuted: '#6e7681',
+            border: '#30363d',
+            accent: '#58a6ff',
+            btnPrimaryBg: '#58a6ff',
+            btnPrimaryText: '#0d1117',
+            btnPrimaryHover: '#79b8ff',
+            tooltipBg: '#161b22',
+            tooltipText: '#c9d1d9',
+            keyBg: 'rgba(88,166,255,0.15)',
         },
         sepia: {
             background: '#f4ecd8',
-            text: '#5c4b37', textSecondary: '#7a6a56', textMuted: '#998875',
-            border: '#d4c8b0', accent: '#8b4513',
-            btnPrimaryBg: '#5c4b37', btnPrimaryText: '#f4ecd8', btnPrimaryHover: '#7a6a56',
-            tooltipBg: '#5c4b37', tooltipText: '#f4ecd8',
-            keyBg: 'rgba(92,75,55,0.15)'
+            text: '#5c4b37',
+            textSecondary: '#7a6a56',
+            textMuted: '#998875',
+            border: '#d4c8b0',
+            accent: '#8b4513',
+            btnPrimaryBg: '#5c4b37',
+            btnPrimaryText: '#f4ecd8',
+            btnPrimaryHover: '#7a6a56',
+            tooltipBg: '#5c4b37',
+            tooltipText: '#f4ecd8',
+            keyBg: 'rgba(92,75,55,0.15)',
         },
         catppuccin: {
             background: '#1e1e2e',
-            text: '#cdd6f4', textSecondary: '#a6adc8', textMuted: '#585b70',
-            border: '#313244', accent: '#cba6f7',
-            btnPrimaryBg: '#cba6f7', btnPrimaryText: '#1e1e2e', btnPrimaryHover: '#b4befe',
-            tooltipBg: '#313244', tooltipText: '#cdd6f4',
-            keyBg: 'rgba(203,166,247,0.12)'
+            text: '#cdd6f4',
+            textSecondary: '#a6adc8',
+            textMuted: '#585b70',
+            border: '#313244',
+            accent: '#cba6f7',
+            btnPrimaryBg: '#cba6f7',
+            btnPrimaryText: '#1e1e2e',
+            btnPrimaryHover: '#b4befe',
+            tooltipBg: '#313244',
+            tooltipText: '#cdd6f4',
+            keyBg: 'rgba(203,166,247,0.12)',
         },
         gruvbox: {
             background: '#1d2021',
-            text: '#ebdbb2', textSecondary: '#a89984', textMuted: '#665c54',
-            border: '#3c3836', accent: '#fe8019',
-            btnPrimaryBg: '#fe8019', btnPrimaryText: '#1d2021', btnPrimaryHover: '#fabd2f',
-            tooltipBg: '#3c3836', tooltipText: '#ebdbb2',
-            keyBg: 'rgba(254,128,25,0.12)'
+            text: '#ebdbb2',
+            textSecondary: '#a89984',
+            textMuted: '#665c54',
+            border: '#3c3836',
+            accent: '#fe8019',
+            btnPrimaryBg: '#fe8019',
+            btnPrimaryText: '#1d2021',
+            btnPrimaryHover: '#fabd2f',
+            tooltipBg: '#3c3836',
+            tooltipText: '#ebdbb2',
+            keyBg: 'rgba(254,128,25,0.12)',
         },
         rosepine: {
             background: '#191724',
-            text: '#e0def4', textSecondary: '#908caa', textMuted: '#6e6a86',
-            border: '#26233a', accent: '#ebbcba',
-            btnPrimaryBg: '#ebbcba', btnPrimaryText: '#191724', btnPrimaryHover: '#f6c177',
-            tooltipBg: '#26233a', tooltipText: '#e0def4',
-            keyBg: 'rgba(235,188,186,0.12)'
+            text: '#e0def4',
+            textSecondary: '#908caa',
+            textMuted: '#6e6a86',
+            border: '#26233a',
+            accent: '#ebbcba',
+            btnPrimaryBg: '#ebbcba',
+            btnPrimaryText: '#191724',
+            btnPrimaryHover: '#f6c177',
+            tooltipBg: '#26233a',
+            tooltipText: '#e0def4',
+            keyBg: 'rgba(235,188,186,0.12)',
         },
         solarized: {
             background: '#002b36',
-            text: '#93a1a1', textSecondary: '#839496', textMuted: '#586e75',
-            border: '#073642', accent: '#2aa198',
-            btnPrimaryBg: '#2aa198', btnPrimaryText: '#002b36', btnPrimaryHover: '#268bd2',
-            tooltipBg: '#073642', tooltipText: '#93a1a1',
-            keyBg: 'rgba(42,161,152,0.12)'
+            text: '#93a1a1',
+            textSecondary: '#839496',
+            textMuted: '#586e75',
+            border: '#073642',
+            accent: '#2aa198',
+            btnPrimaryBg: '#2aa198',
+            btnPrimaryText: '#002b36',
+            btnPrimaryHover: '#268bd2',
+            tooltipBg: '#073642',
+            tooltipText: '#93a1a1',
+            keyBg: 'rgba(42,161,152,0.12)',
         },
         tokyonight: {
             background: '#1a1b26',
-            text: '#c0caf5', textSecondary: '#9aa5ce', textMuted: '#565f89',
-            border: '#292e42', accent: '#7aa2f7',
-            btnPrimaryBg: '#7aa2f7', btnPrimaryText: '#1a1b26', btnPrimaryHover: '#bb9af7',
-            tooltipBg: '#292e42', tooltipText: '#c0caf5',
-            keyBg: 'rgba(122,162,247,0.12)'
+            text: '#c0caf5',
+            textSecondary: '#9aa5ce',
+            textMuted: '#565f89',
+            border: '#292e42',
+            accent: '#7aa2f7',
+            btnPrimaryBg: '#7aa2f7',
+            btnPrimaryText: '#1a1b26',
+            btnPrimaryHover: '#bb9af7',
+            tooltipBg: '#292e42',
+            tooltipText: '#c0caf5',
+            keyBg: 'rgba(122,162,247,0.12)',
         },
     },
 
@@ -878,29 +989,31 @@ const theme = {
             gruvbox: 'Gruvbox Dark',
             rosepine: 'Ros\u00e9 Pine',
             solarized: 'Solarized Dark',
-            tokyonight: 'Tokyo Night'
+            tokyonight: 'Tokyo Night',
         };
         return Object.keys(this.themes).map(key => ({
             value: key,
             name: names[key] || key,
-            colors: this.themes[key]
+            colors: this.themes[key],
         }));
     },
 
     hexToRgb(hex) {
         const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-        return result ? {
-            r: parseInt(result[1], 16),
-            g: parseInt(result[2], 16),
-            b: parseInt(result[3], 16)
-        } : { r: 30, g: 30, b: 30 };
+        return result
+            ? {
+                  r: parseInt(result[1], 16),
+                  g: parseInt(result[2], 16),
+                  b: parseInt(result[3], 16),
+              }
+            : { r: 30, g: 30, b: 30 };
     },
 
     lightenColor(rgb, amount) {
         return {
             r: Math.min(255, rgb.r + amount),
             g: Math.min(255, rgb.g + amount),
-            b: Math.min(255, rgb.b + amount)
+            b: Math.min(255, rgb.b + amount),
         };
     },
 
@@ -908,7 +1021,7 @@ const theme = {
         return {
             r: Math.max(0, rgb.r - amount),
             g: Math.max(0, rgb.g - amount),
-            b: Math.max(0, rgb.b - amount)
+            b: Math.max(0, rgb.b - amount),
         };
     },
 
@@ -1004,7 +1117,7 @@ const theme = {
     async save(themeName) {
         await storage.updatePreference('theme', themeName);
         this.apply(themeName);
-    }
+    },
 };
 
 // Consolidated cheatingDaddy object - all functions in one place
@@ -1029,6 +1142,7 @@ const cheatingDaddy = {
     initializeGemini,
     initializeCloud,
     initializeLocal,
+    initializeClaude,
     startCapture,
     stopCapture,
     sendTextMessage,

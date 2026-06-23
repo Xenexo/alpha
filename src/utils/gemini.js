@@ -13,7 +13,14 @@ function getLocalAi() {
     return _localai;
 }
 
-// Provider mode: 'byok', 'cloud', or 'local'
+// Lazy-loaded to avoid circular dependency (claude.js imports from gemini.js)
+let _claude = null;
+function getClaude() {
+    if (!_claude) _claude = require('./claude');
+    return _claude;
+}
+
+// Provider mode: 'byok', 'cloud', 'local', or 'claude'
 let currentProviderMode = 'byok';
 
 // Groq conversation history for context
@@ -28,6 +35,8 @@ let currentProfile = null;
 let currentCustomPrompt = null;
 let isInitializingSession = false;
 let currentSystemPrompt = null;
+// Only prompt for Screen Recording permission once per app run to avoid spamming.
+let screenPermissionNotified = false;
 
 function formatSpeakerResults(results) {
     let text = '';
@@ -54,10 +63,36 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
 
+// Timer used to fire the text-API call shortly after turnComplete
+let turnCompleteTimer = null;
+
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
     if (windows.length > 0) {
         windows[0].webContents.send(channel, data);
+    }
+}
+
+// Surface a macOS Screen Recording permission failure to the user. Both system
+// audio (SystemAudioDump via ScreenCaptureKit) and screen capture require this
+// permission, so without it listening and screen analysis silently fail.
+// Shows a clear status and opens the relevant Settings pane once per run.
+function notifyScreenRecordingPermission() {
+    if (screenPermissionNotified) return;
+    screenPermissionNotified = true;
+
+    sendToRenderer(
+        'update-status',
+        'Screen Recording permission required — enable it in System Settings, then restart the app.'
+    );
+
+    if (process.platform === 'darwin') {
+        try {
+            const { shell } = require('electron');
+            shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+        } catch (err) {
+            console.error('Failed to open Screen Recording settings:', err);
+        }
     }
 }
 
@@ -345,7 +380,7 @@ async function sendToGroq(transcription) {
     }
 }
 
-async function sendToGemma(transcription) {
+async function sendToGeminiText(transcription) {
     const apiKey = getApiKey();
     if (!apiKey) {
         console.log('No Gemini API key configured');
@@ -353,11 +388,12 @@ async function sendToGemma(transcription) {
     }
 
     if (!transcription || transcription.trim() === '') {
-        console.log('Empty transcription, skipping Gemma');
+        console.log('Empty transcription, skipping Gemini text response');
         return;
     }
 
-    console.log('Sending to Gemma:', transcription.substring(0, 100) + '...');
+    const model = getAvailableModel();
+    console.log(`Sending to ${model}:`, transcription.substring(0, 100) + '...');
 
     groqConversationHistory.push({
         role: 'user',
@@ -375,35 +411,37 @@ async function sendToGemma(transcription) {
         }));
 
         const systemPrompt = currentSystemPrompt || 'You are a helpful assistant.';
-        const messagesWithSystem = [
-            { role: 'user', parts: [{ text: systemPrompt }] },
-            { role: 'model', parts: [{ text: 'Understood. I will follow these instructions.' }] },
-            ...messages
-        ];
 
         const response = await ai.models.generateContentStream({
-            model: 'gemma-3-27b-it',
-            contents: messagesWithSystem,
+            model: model,
+            contents: messages,
+            config: {
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            },
         });
+
+        // Count the request against today's per-model rate limit (RPD).
+        incrementLimitCount(model);
 
         let fullText = '';
         let isFirst = true;
 
         for await (const chunk of response) {
-            const chunkText = chunk.text;
+            // gemini-2.5-flash is a thinking model: reasoning arrives as parts
+            // flagged `thought: true`, with the actual answer in separate
+            // un-flagged parts. chunk.text concatenates both, so filter thoughts
+            // out and stream only the answer parts.
+            const parts = chunk.candidates?.[0]?.content?.parts || [];
+            const chunkText = parts
+                .filter(part => part.text && !part.thought)
+                .map(part => part.text)
+                .join('');
             if (chunkText) {
                 fullText += chunkText;
                 sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
                 isFirst = false;
             }
         }
-
-        const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
-        const historyChars = trimmedHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
-        const inputChars = systemPromptChars + historyChars;
-        const outputChars = fullText.length;
-
-        incrementCharUsage('gemini', 'gemma-3-27b-it', inputChars + outputChars);
 
         if (fullText.trim()) {
             groqConversationHistory.push({
@@ -418,12 +456,12 @@ async function sendToGemma(transcription) {
             saveConversationTurn(transcription, fullText);
         }
 
-        console.log('Gemma response completed');
+        console.log(`${model} response completed`);
         sendToRenderer('update-status', 'Listening...');
 
     } catch (error) {
-        console.error('Error calling Gemma API:', error);
-        sendToRenderer('update-status', 'Gemma error: ' + error.message);
+        console.error('Error calling Gemini text API:', error);
+        sendToRenderer('update-status', 'Gemini error: ' + error.message);
     }
 }
 
@@ -485,20 +523,40 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     // DISABLED: Gemini's outputTranscription - using Groq for faster responses instead
                     // if (message.serverContent?.outputTranscription?.text) { ... }
 
+                    if (message.serverContent?.turnComplete) {
+                        sendToRenderer('update-status', 'Listening...');
+                        // Fire the text-API call shortly after turnComplete so we don't
+                        // wait for Gemini to finish generating its full audio response.
+                        // A small delay lets the final inputTranscription chunk arrive.
+                        if (turnCompleteTimer) clearTimeout(turnCompleteTimer);
+                        turnCompleteTimer = setTimeout(() => {
+                            turnCompleteTimer = null;
+                            if (currentTranscription.trim() !== '') {
+                                if (hasGroqKey()) {
+                                    sendToGroq(currentTranscription);
+                                } else {
+                                    sendToGeminiText(currentTranscription);
+                                }
+                                currentTranscription = '';
+                            }
+                        }, 150);
+                    }
+
                     if (message.serverContent?.generationComplete) {
+                        // Fallback: send any transcription that wasn't caught at turnComplete.
                         if (currentTranscription.trim() !== '') {
+                            if (turnCompleteTimer) {
+                                clearTimeout(turnCompleteTimer);
+                                turnCompleteTimer = null;
+                            }
                             if (hasGroqKey()) {
                                 sendToGroq(currentTranscription);
                             } else {
-                                sendToGemma(currentTranscription);
+                                sendToGeminiText(currentTranscription);
                             }
                             currentTranscription = '';
                         }
                         messageBuffer = '';
-                    }
-
-                    if (message.serverContent?.turnComplete) {
-                        sendToRenderer('update-status', 'Listening...');
                     }
                 },
                 onerror: function (e) {
@@ -706,6 +764,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
                 sendCloudAudio(monoChunk);
             } else if (currentProviderMode === 'local') {
                 getLocalAi().processLocalAudio(monoChunk);
+            } else if (currentProviderMode === 'claude') {
+                getClaude().processClaudeAudio(monoChunk);
             } else {
                 const base64Data = monoChunk.toString('base64');
                 sendAudioToGemini(base64Data, geminiSessionRef);
@@ -724,12 +784,21 @@ async function startMacOSAudioCapture(geminiSessionRef) {
     });
 
     systemAudioProc.stderr.on('data', data => {
-        console.error('SystemAudioDump stderr:', data.toString());
+        const text = data.toString();
+        console.error('SystemAudioDump stderr:', text);
+        if (/permission|screen recording/i.test(text)) {
+            notifyScreenRecordingPermission();
+        }
     });
 
     systemAudioProc.on('close', code => {
         console.log('SystemAudioDump process closed with code:', code);
         systemAudioProc = null;
+        // A non-zero exit (not a SIGTERM stop, which reports a null code) on macOS
+        // almost always means Screen Recording permission was denied.
+        if (code !== 0 && code !== null && process.platform === 'darwin') {
+            notifyScreenRecordingPermission();
+        }
     });
 
     systemAudioProc.on('error', err => {
@@ -874,6 +943,36 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         return success;
     });
 
+    ipcMain.handle('initialize-claude', async (event, claudeMode, anthropicApiKey, claudeModel, whisperModel, profile, customPrompt) => {
+        currentProviderMode = 'claude';
+        const success = await getClaude().initializeClaudeSession(claudeMode, {
+            anthropicApiKey,
+            model: claudeModel,
+            whisperModel,
+            profile,
+            customPrompt,
+        });
+        if (!success) {
+            currentProviderMode = 'byok';
+        }
+        return success;
+    });
+
+    ipcMain.handle('list-claude-models', async (event, apiKey) => {
+        if (!apiKey || !apiKey.trim()) return null;
+        try {
+            const Anthropic = require('@anthropic-ai/sdk');
+            const client = new Anthropic({ apiKey: apiKey.trim() });
+            const response = await client.models.list({ limit: 100 });
+            return response.data
+                .filter(m => m.id.startsWith('claude-'))
+                .map(m => ({ id: m.id, name: m.display_name || m.id }))
+                .sort((a, b) => b.created - a.created);
+        } catch (e) {
+            return null;
+        }
+    });
+
     ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
         if (currentProviderMode === 'cloud') {
             try {
@@ -892,6 +991,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local audio:', error);
+                return { success: false, error: error.message };
+            }
+        }
+        if (currentProviderMode === 'claude') {
+            try {
+                const pcmBuffer = Buffer.from(data, 'base64');
+                getClaude().processClaudeAudio(pcmBuffer);
+                return { success: true };
+            } catch (error) {
+                console.error('Error sending claude audio:', error);
                 return { success: false, error: error.message };
             }
         }
@@ -927,6 +1036,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local mic audio:', error);
+                return { success: false, error: error.message };
+            }
+        }
+        if (currentProviderMode === 'claude') {
+            try {
+                const pcmBuffer = Buffer.from(data, 'base64');
+                getClaude().processClaudeAudio(pcmBuffer);
+                return { success: true };
+            } catch (error) {
+                console.error('Error sending claude mic audio:', error);
                 return { success: false, error: error.message };
             }
         }
@@ -972,6 +1091,11 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
+            if (currentProviderMode === 'claude') {
+                const result = await getClaude().sendClaudeImage(data, prompt);
+                return result;
+            }
+
             // Use HTTP API instead of realtime session
             const result = await sendImageToGeminiHttp(data, prompt);
             return result;
@@ -1007,6 +1131,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
         }
 
+        if (currentProviderMode === 'claude') {
+            try {
+                console.log('Sending text to Claude:', text);
+                return await getClaude().sendClaudeText(text.trim());
+            } catch (error) {
+                console.error('Error sending claude text:', error);
+                return { success: false, error: error.message };
+            }
+        }
+
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
 
         try {
@@ -1015,7 +1149,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             if (hasGroqKey()) {
                 sendToGroq(text.trim());
             } else {
-                sendToGemma(text.trim());
+                sendToGeminiText(text.trim());
             }
 
             await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
@@ -1065,6 +1199,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
             if (currentProviderMode === 'local') {
                 getLocalAi().closeLocalSession();
+                currentProviderMode = 'byok';
+                return { success: true };
+            }
+
+            if (currentProviderMode === 'claude') {
+                getClaude().closeClaudeSession();
                 currentProviderMode = 'byok';
                 return { success: true };
             }
@@ -1126,6 +1266,7 @@ module.exports = {
     sendToRenderer,
     initializeNewSession,
     saveConversationTurn,
+    saveScreenAnalysis,
     getCurrentSessionData,
     killExistingSystemAudioDump,
     startMacOSAudioCapture,

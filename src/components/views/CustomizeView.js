@@ -303,6 +303,8 @@ export class CustomizeView extends LitElement {
             nextResponse: isMac ? 'Cmd+]' : 'Ctrl+]',
             scrollUp: isMac ? 'Cmd+Shift+Up' : 'Ctrl+Shift+Up',
             scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
+            analyzeScreen: isMac ? 'Cmd+Shift+S' : 'Ctrl+Shift+S',
+            searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
         };
     }
 
@@ -319,6 +321,8 @@ export class CustomizeView extends LitElement {
             { key: 'nextResponse', name: 'Next Response', description: 'Move to next AI response' },
             { key: 'scrollUp', name: 'Scroll Response Up', description: 'Scroll response content upward' },
             { key: 'scrollDown', name: 'Scroll Response Down', description: 'Scroll response content downward' },
+            { key: 'analyzeScreen', name: 'Analyze Screen Now', description: 'Capture screen and ask the AI immediately, from anywhere' },
+            { key: 'searchSelection', name: 'Ask About Selected Text', description: 'Copy current selection in any app and send it to the AI' },
         ];
     }
 

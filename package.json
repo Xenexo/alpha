@@ -1,8 +1,8 @@
 {
-    "name": "cheating-daddy",
-    "productName": "cheating-daddy",
+    "name": "help-guru",
+    "productName": "help-guru",
     "version": "0.7.0",
-    "description": "cheating daddy",
+    "description": "alpha",
     "main": "src/index.js",
     "scripts": {
         "start": "electron-forge start",
@@ -12,11 +12,11 @@
         "lint": "echo \"No linting configured\""
     },
     "keywords": [
-        "cheating daddy",
-        "cheating daddy ai",
-        "cheating daddy ai assistant",
-        "cheating daddy ai assistant for interviews",
-        "cheating daddy ai assistant for interviews"
+        "alpha",
+        "alpha ai",
+        "alpha ai assistant",
+        "alpha ai assistant for interviews",
+        "alpha ai assistant for interviews"
     ],
     "author": {
         "name": "sohzm",
@@ -24,6 +24,8 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
+        "@anthropic-ai/claude-code": "^1.0.33",
+        "@anthropic-ai/sdk": "^0.104.1",
         "@google/genai": "^1.2.0",
         "@huggingface/transformers": "^3.8.1",
         "electron-squirrel-startup": "^1.0.1",

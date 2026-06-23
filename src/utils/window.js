@@ -3,6 +3,9 @@ const path = require('node:path');
 const storage = require('../storage');
 
 let mouseEventsIgnored = false;
+let clipboardWatchInterval = null;
+let lastClipboardText = '';
+let autoSelectionEnabled = false;
 
 const DEFAULT_MAIN_WINDOW_SIZE = { width: 1100, height: 800 };
 const MIN_WINDOW_SIZE = { width: 700, height: 320 };
@@ -105,7 +108,71 @@ function getDefaultKeybinds() {
         scrollUp: isMac ? 'Cmd+Shift+Up' : 'Ctrl+Shift+Up',
         scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
         emergencyErase: isMac ? 'Cmd+Shift+E' : 'Ctrl+Shift+E',
+        analyzeScreen: isMac ? 'Cmd+Shift+S' : 'Ctrl+Shift+S',
+        searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
     };
+}
+
+// Grab the user's current text selection in any app by simulating a copy,
+// reading the clipboard, then restoring the previous clipboard contents.
+async function captureSelectedText() {
+    const { clipboard } = require('electron');
+
+    if (process.platform === 'darwin') {
+        const saved = clipboard.readText();
+        try {
+            const { execFile } = require('child_process');
+            await new Promise((resolve, reject) => {
+                execFile(
+                    'osascript',
+                    ['-e', 'tell application "System Events" to keystroke "c" using command down'],
+                    { timeout: 3000 },
+                    (err, stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve())
+                );
+            });
+            // Give the focused app time to write the selection to the clipboard
+            await new Promise(r => setTimeout(r, 250));
+            const text = clipboard.readText();
+            clipboard.writeText(saved);
+            return { success: true, text };
+        } catch (err) {
+            clipboard.writeText(saved);
+            // System Events keystroke requires Accessibility permission
+            if (/not allowed|assistive|1002|-1719/i.test(err.message)) {
+                return { success: false, error: 'accessibility', text: saved };
+            }
+            return { success: false, error: err.message, text: saved };
+        }
+    }
+
+    // Windows/Linux: no keystroke simulation without native deps — use whatever
+    // the user already copied
+    return { success: true, text: clipboard.readText(), fallback: true };
+}
+
+function startClipboardWatcher(mainWindow, sendToRenderer) {
+    if (clipboardWatchInterval) return;
+    const { clipboard } = require('electron');
+    lastClipboardText = clipboard.readText();
+    clipboardWatchInterval = setInterval(() => {
+        if (!autoSelectionEnabled) return;
+        const current = clipboard.readText();
+        if (current && current !== lastClipboardText && current.trim().length > 0) {
+            lastClipboardText = current;
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                if (!mainWindow.isVisible()) mainWindow.showInactive();
+                sendToRenderer('selection-captured', current.trim());
+            }
+        }
+    }, 400);
+}
+
+function stopClipboardWatcher() {
+    if (clipboardWatchInterval) {
+        clearInterval(clipboardWatchInterval);
+        clipboardWatchInterval = null;
+    }
+    autoSelectionEnabled = false;
 }
 
 function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessionRef) {
@@ -265,6 +332,60 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
         }
     }
 
+    // Register analyze-screen shortcut (works from any view, shows window if hidden)
+    if (keybinds.analyzeScreen) {
+        try {
+            globalShortcut.register(keybinds.analyzeScreen, () => {
+                console.log('Analyze screen shortcut triggered');
+                try {
+                    if (!mainWindow.isVisible()) {
+                        mainWindow.showInactive();
+                    }
+                    mainWindow.webContents.executeJavaScript(`
+                        cheatingDaddy.handleShortcut('analyze-screen');
+                    `);
+                } catch (error) {
+                    console.error('Error handling analyze screen shortcut:', error);
+                }
+            });
+            console.log(`Registered analyzeScreen: ${keybinds.analyzeScreen}`);
+        } catch (error) {
+            console.error(`Failed to register analyzeScreen (${keybinds.analyzeScreen}):`, error);
+        }
+    }
+
+    // Register selected-text search shortcut
+    if (keybinds.searchSelection) {
+        try {
+            globalShortcut.register(keybinds.searchSelection, async () => {
+                console.log('Search selection shortcut triggered');
+                try {
+                    const result = await captureSelectedText();
+                    if (result.error === 'accessibility') {
+                        sendToRenderer(
+                            'update-status',
+                            'Grant Accessibility permission to alpha (System Settings → Privacy & Security → Accessibility) to capture selected text'
+                        );
+                        // Fall through with clipboard contents as a fallback
+                    }
+                    if (!result.text || !result.text.trim()) {
+                        sendToRenderer('update-status', 'No text selected or in clipboard');
+                        return;
+                    }
+                    if (!mainWindow.isVisible()) {
+                        mainWindow.showInactive();
+                    }
+                    sendToRenderer('selection-captured', result.text.trim());
+                } catch (error) {
+                    console.error('Error handling search selection shortcut:', error);
+                }
+            });
+            console.log(`Registered searchSelection: ${keybinds.searchSelection}`);
+        } catch (error) {
+            console.error(`Failed to register searchSelection (${keybinds.searchSelection}):`, error);
+        }
+    }
+
     // Register emergency erase shortcut
     if (keybinds.emergencyErase) {
         try {
@@ -294,6 +415,15 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 }
 
 function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
+    ipcMain.on('session-state-changed', (event, active) => {
+        if (active) {
+            autoSelectionEnabled = true;
+            startClipboardWatcher(mainWindow, sendToRenderer);
+        } else {
+            stopClipboardWatcher();
+        }
+    });
+
     ipcMain.on('view-changed', (event, view) => {
         if (!mainWindow.isDestroyed()) {
             if (view !== 'assistant') {
@@ -331,7 +461,6 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
             return { success: false, error: error.message };
         }
     });
-
 }
 
 module.exports = {
@@ -339,4 +468,5 @@ module.exports = {
     getDefaultKeybinds,
     updateGlobalShortcuts,
     setupWindowIpcHandlers,
+    stopClipboardWatcher,
 };
