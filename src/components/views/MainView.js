@@ -547,7 +547,7 @@ export class MainView extends LitElement {
         this._showLocalHelp = false;
         this._ollamaHost = 'http://127.0.0.1:11434';
         this._ollamaModel = 'llama3.1';
-        this._whisperModel = 'Xenova/whisper-base';
+        this._whisperModel = 'Xenova/whisper-tiny';
         this._claudeMode = 'cli';
         this._anthropicKey = '';
         this._claudeModel = 'claude-haiku-4-5-20251001';
@@ -587,7 +587,7 @@ export class MainView extends LitElement {
             // Load local AI settings
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
-            this._whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
+            this._whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
 
             // Load Claude settings
             this._claudeMode = prefs.claudeMode || 'cli';
@@ -1006,9 +1006,9 @@ export class MainView extends LitElement {
                 </div>
                 <select .value=${this._whisperModel} @change=${e => this._saveWhisperModel(e.target.value)}>
                     <option value="Xenova/whisper-tiny" ?selected=${this._whisperModel === 'Xenova/whisper-tiny'}>
-                        Tiny (fastest, least accurate)
+                        Tiny (recommended for speed)
                     </option>
-                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>Base (recommended)</option>
+                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>Base (more accurate, slower)</option>
                     <option value="Xenova/whisper-small" ?selected=${this._whisperModel === 'Xenova/whisper-small'}>
                         Small (unstable — crashes on some Macs)
                     </option>

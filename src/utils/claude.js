@@ -19,7 +19,7 @@ let isTranscriptResponseInFlight = false;
 let pendingTranscripts = [];
 let transcriptDebounceTimer = null;
 
-const TRANSCRIPT_DEBOUNCE_MS = 600;
+const TRANSCRIPT_DEBOUNCE_MS = 250;
 const RESPONSE_UPDATE_INTERVAL_MS = 50;
 
 // Claude Code CLI state
@@ -288,6 +288,8 @@ function runClaudeCli(prompt, { allowedTools } = {}) {
 // Uses the same auth as `claude login`. Eliminates per-request spawn overhead.
 
 async function runClaudeQuery(prompt) {
+    const requestStartedAt = Date.now();
+    let firstTokenLogged = false;
     let query;
     try {
         query = await getQueryFn();
@@ -357,11 +359,19 @@ async function runClaudeQuery(prompt) {
             } else if (msg.type === 'stream_event') {
                 const ev = msg.event;
                 if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+                    if (!firstTokenLogged) {
+                        firstTokenLogged = true;
+                        console.log(`[Claude] First token in ${Date.now() - requestStartedAt}ms`);
+                    }
                     delta += ev.delta.text;
                     fullText = committed + (committed && delta ? '\n' : '') + delta;
                     emitResponse();
                 }
             } else if (msg.type === 'assistant') {
+                if (!firstTokenLogged) {
+                    firstTokenLogged = true;
+                    console.log(`[Claude] First response in ${Date.now() - requestStartedAt}ms`);
+                }
                 const text = (msg.message?.content || [])
                     .filter(b => b.type === 'text' && b.text)
                     .map(b => b.text)
@@ -399,6 +409,7 @@ async function runClaudeQuery(prompt) {
     }
 
     if (!fullText) return { success: false, error: 'Claude returned no response' };
+    console.log(`[Claude] Response completed in ${Date.now() - requestStartedAt}ms`);
     sendToRenderer('update-status', 'Listening...');
     return { success: true, text: fullText };
 }

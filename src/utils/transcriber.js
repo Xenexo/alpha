@@ -22,7 +22,7 @@ const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
     LOW_BITRATE: { energyThreshold: 0.008, speechFramesRequired: 4, silenceFramesRequired: 35 },
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
-    VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 10 },
+    VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 3 },
 };
 let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
 
@@ -160,6 +160,7 @@ async function transcribeAudio(pcm16kBuffer) {
     }
 
     try {
+        const startedAt = Date.now();
         const float32Audio = pcm16ToFloat32(pcm16kBuffer);
 
         // Whisper expects audio at 16kHz which is what we have
@@ -170,7 +171,7 @@ async function transcribeAudio(pcm16kBuffer) {
         });
 
         const text = result.text?.trim();
-        console.log('[Transcriber] Transcription:', text);
+        console.log(`[Transcriber] Completed in ${Date.now() - startedAt}ms:`, text);
         return text;
     } catch (error) {
         console.error('[Transcriber] Transcription error:', error);

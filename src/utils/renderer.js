@@ -157,7 +157,7 @@ async function initializeLocal(profile = 'interview') {
     const prefs = await storage.getPreferences();
     const ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
     const ollamaModel = prefs.ollamaModel || 'llama3.1';
-    const whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
+    const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
     const customPrompt = prefs.customPrompt || '';
 
     const success = await ipcRenderer.invoke('initialize-local', ollamaHost, ollamaModel, whisperModel, profile, customPrompt);
@@ -175,7 +175,7 @@ async function initializeClaude(profile = 'interview') {
     const creds = await storage.getCredentials();
     const claudeMode = prefs.claudeMode || 'cli';
     const claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
-    const whisperModel = prefs.whisperModel || 'Xenova/whisper-base';
+    const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
     const customPrompt = prefs.customPrompt || '';
 
     const success = await ipcRenderer.invoke(

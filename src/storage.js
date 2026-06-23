@@ -31,7 +31,8 @@ const DEFAULT_PREFERENCES = {
     googleSearchEnabled: false,
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
-    whisperModel: 'Xenova/whisper-base',
+    whisperModel: 'Xenova/whisper-tiny',
+    whisperFastDefaultApplied: true,
     claudeMode: 'cli',
     claudeModel: 'claude-haiku-4-5-20251001',
     claudeFastDefaultApplied: true,
@@ -230,6 +231,15 @@ function getPreferences() {
             saved.claudeModel = DEFAULT_PREFERENCES.claudeModel;
         }
         saved.claudeFastDefaultApplied = true;
+        writeJsonFile(getPreferencesPath(), saved);
+    }
+
+    // One-time latency migration from the previous Whisper Base default.
+    if (!Object.prototype.hasOwnProperty.call(saved, 'whisperFastDefaultApplied')) {
+        if (!saved.whisperModel || saved.whisperModel === 'Xenova/whisper-base') {
+            saved.whisperModel = DEFAULT_PREFERENCES.whisperModel;
+        }
+        saved.whisperFastDefaultApplied = true;
         writeJsonFile(getPreferencesPath(), saved);
     }
 
