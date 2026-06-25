@@ -31,7 +31,7 @@ const DEFAULT_PREFERENCES = {
     googleSearchEnabled: false,
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
-    whisperModel: 'Xenova/whisper-tiny',
+    whisperModel: 'onnx-community/whisper-large-v3-turbo',
     whisperFastDefaultApplied: true,
     claudeMode: 'cli',
     claudeModel: 'claude-haiku-4-5-20251001',

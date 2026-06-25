@@ -1015,6 +1015,12 @@ export class MainView extends LitElement {
                     <option value="Xenova/whisper-medium" ?selected=${this._whisperModel === 'Xenova/whisper-medium'}>
                         Medium (unstable — crashes on some Macs)
                     </option>
+                    <option
+                        value="onnx-community/whisper-large-v3-turbo"
+                        ?selected=${this._whisperModel === 'onnx-community/whisper-large-v3-turbo'}
+                    >
+                        Large v3 Turbo (most accurate, large download)
+                    </option>
                 </select>
                 <div class="form-hint">
                     ${this.whisperDownloading ? 'Downloading model...' : 'Used for speech-to-text, downloaded automatically on first use'}

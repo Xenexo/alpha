@@ -13,6 +13,50 @@ export class AssistantView extends LitElement {
             cursor: default;
         }
 
+        /* ── Transcript panel (what was heard) ── */
+
+        .transcript-panel {
+            flex-shrink: 0;
+            max-height: 96px;
+            overflow-y: auto;
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            padding: var(--space-xs) var(--space-md);
+        }
+
+        .transcript-label {
+            font-size: var(--font-size-xs);
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+            letter-spacing: var(--tracking-tight);
+            margin-bottom: 2px;
+        }
+
+        .transcript-item {
+            font-size: var(--font-size-sm);
+            color: var(--text-secondary);
+            line-height: var(--line-height-compact);
+            margin: 2px 0;
+        }
+
+        .transcript-item.latest {
+            color: var(--text-primary);
+        }
+
+        .transcript-panel::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .transcript-panel::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .transcript-panel::-webkit-scrollbar-thumb {
+            background: var(--border-strong);
+            border-radius: 3px;
+        }
+
         /* ── Response area ── */
 
         .response-container {
@@ -37,8 +81,30 @@ export class AssistantView extends LitElement {
             cursor: pointer;
         }
 
-        .response-container [data-word] {
-            display: inline-block;
+        /* ── Generating indicator (shown while a response streams in) ── */
+
+        .generating {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-muted);
+            font-size: var(--response-font-size, 15px);
+        }
+
+        .generating .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            animation: gen-pulse 1.2s ease-in-out infinite;
+        }
+
+        .generating .dot:nth-child(2) { animation-delay: 0.2s; }
+        .generating .dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes gen-pulse {
+            0%, 100% { opacity: 0.25; }
+            50% { opacity: 1; }
         }
 
         /* ── Markdown ── */
@@ -310,24 +376,70 @@ export class AssistantView extends LitElement {
             height: calc(100% + 2px);
             pointer-events: none;
         }
+
+        /* ── Push-to-talk button ── */
+
+        .talk-btn {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            white-space: nowrap;
+            padding: var(--space-xs) var(--space-md);
+            border-radius: 100px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            transition: border-color var(--transition), background var(--transition), color var(--transition);
+            flex-shrink: 0;
+        }
+
+        .talk-btn:hover:not(.listening) {
+            border-color: var(--accent);
+            background: var(--bg-surface);
+        }
+
+        .talk-btn.listening {
+            border-color: var(--danger);
+            color: var(--danger);
+            background: var(--bg-surface);
+        }
+
+        .talk-btn.listening svg {
+            animation: talk-pulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes talk-pulse {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 1; }
+        }
     `;
 
     static properties = {
         responses: { type: Array },
+        transcripts: { type: Array },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
         shouldAnimateResponse: { type: Boolean },
+        isStreaming: { type: Boolean },
         isAnalyzing: { type: Boolean, state: true },
+        isListening: { type: Boolean, state: true },
     };
 
     constructor() {
         super();
         this.responses = [];
+        this.transcripts = [];
         this.currentResponseIndex = -1;
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
+        this.isStreaming = false;
         this.isAnalyzing = false;
+        this.isListening = false;
         this._animFrame = null;
     }
 
@@ -357,43 +469,13 @@ export class AssistantView extends LitElement {
                     gfm: true,
                     sanitize: false,
                 });
-                let rendered = window.marked.parse(content);
-                rendered = this.wrapWordsInSpans(rendered);
-                return rendered;
+                return window.marked.parse(content);
             } catch (error) {
                 console.warn('Error parsing markdown:', error);
                 return content;
             }
         }
         return content;
-    }
-
-    wrapWordsInSpans(html) {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, 'text/html');
-        const tagsToSkip = ['PRE'];
-
-        function wrap(node) {
-            if (node.nodeType === Node.TEXT_NODE && node.textContent.trim() && !tagsToSkip.includes(node.parentNode.tagName)) {
-                const words = node.textContent.split(/(\s+)/);
-                const frag = document.createDocumentFragment();
-                words.forEach(word => {
-                    if (word.trim()) {
-                        const span = document.createElement('span');
-                        span.setAttribute('data-word', '');
-                        span.textContent = word;
-                        frag.appendChild(span);
-                    } else {
-                        frag.appendChild(document.createTextNode(word));
-                    }
-                });
-                node.parentNode.replaceChild(frag, node);
-            } else if (node.nodeType === Node.ELEMENT_NODE && !tagsToSkip.includes(node.tagName)) {
-                Array.from(node.childNodes).forEach(wrap);
-            }
-        }
-        Array.from(doc.body.childNodes).forEach(wrap);
-        return doc.body.innerHTML;
     }
 
     navigateToPreviousResponse() {
@@ -452,6 +534,13 @@ export class AssistantView extends LitElement {
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
             ipcRenderer.on('scroll-response-down', this.handleScrollDown);
         }
+
+        // Keep the talk button in sync with push-to-talk state, whether toggled
+        // by this button or by the global keyboard shortcut.
+        this.handlePushToTalkChanged = e => {
+            this.isListening = !!(e.detail && e.detail.active);
+        };
+        window.addEventListener('push-to-talk-changed', this.handlePushToTalkChanged);
     }
 
     disconnectedCallback() {
@@ -464,6 +553,16 @@ export class AssistantView extends LitElement {
             if (this.handleNextResponse) ipcRenderer.removeListener('navigate-next-response', this.handleNextResponse);
             if (this.handleScrollUp) ipcRenderer.removeListener('scroll-response-up', this.handleScrollUp);
             if (this.handleScrollDown) ipcRenderer.removeListener('scroll-response-down', this.handleScrollDown);
+        }
+
+        if (this.handlePushToTalkChanged) {
+            window.removeEventListener('push-to-talk-changed', this.handlePushToTalkChanged);
+        }
+    }
+
+    handleTalkClick() {
+        if (window.cheatingDaddy && window.cheatingDaddy.togglePushToTalk) {
+            window.cheatingDaddy.togglePushToTalk();
         }
     }
 
@@ -645,8 +744,13 @@ export class AssistantView extends LitElement {
 
     updated(changedProperties) {
         super.updated(changedProperties);
-        if (changedProperties.has('responses') || changedProperties.has('currentResponseIndex')) {
+        if (changedProperties.has('responses') || changedProperties.has('currentResponseIndex') || changedProperties.has('isStreaming')) {
             this.updateResponseContent();
+        }
+
+        if (changedProperties.has('transcripts')) {
+            const panel = this.shadowRoot.querySelector('#transcriptPanel');
+            if (panel) panel.scrollTop = panel.scrollHeight;
         }
 
         if (changedProperties.has('isAnalyzing')) {
@@ -666,13 +770,26 @@ export class AssistantView extends LitElement {
 
     updateResponseContent() {
         const container = this.shadowRoot.querySelector('#responseContainer');
-        if (container) {
-            const currentResponse = this.getCurrentResponse();
-            const renderedResponse = this.renderMarkdown(currentResponse);
-            container.innerHTML = renderedResponse;
-            if (this.shouldAnimateResponse) {
-                this.dispatchEvent(new CustomEvent('response-animation-complete', { bubbles: true, composed: true }));
-            }
+        if (!container) return;
+
+        // Render the answer as it streams in. The main process already
+        // throttles update-response events, so re-parsing markdown per update
+        // is cheap and lets the user read the reply as it arrives. Show the
+        // "Generating" indicator only before any text has landed.
+        const currentResponse = this.getCurrentResponse();
+        const isLatest = this.currentResponseIndex === this.responses.length - 1;
+        if (this.isStreaming && isLatest && !currentResponse) {
+            container.innerHTML = '<div class="generating">Generating response<span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';
+            return;
+        }
+
+        container.innerHTML = this.renderMarkdown(currentResponse);
+        // Keep the newest text in view while it streams in.
+        if (this.isStreaming && isLatest) {
+            container.scrollTop = container.scrollHeight;
+        }
+        if (this.shouldAnimateResponse) {
+            this.dispatchEvent(new CustomEvent('response-animation-complete', { bubbles: true, composed: true }));
         }
     }
 
@@ -680,6 +797,15 @@ export class AssistantView extends LitElement {
         const hasMultipleResponses = this.responses.length > 1;
 
         return html`
+            ${this.transcripts && this.transcripts.length > 0 ? html`
+                <div class="transcript-panel" id="transcriptPanel">
+                    <div class="transcript-label">Heard</div>
+                    ${this.transcripts.map((t, i) => html`
+                        <div class="transcript-item ${i === this.transcripts.length - 1 ? 'latest' : ''}">${t}</div>
+                    `)}
+                </div>
+            ` : ''}
+
             <div class="response-container" id="responseContainer"></div>
 
             ${hasMultipleResponses ? html`
@@ -707,6 +833,18 @@ export class AssistantView extends LitElement {
                         @keydown=${this.handleTextKeydown}
                     />
                 </div>
+                <button
+                    class="talk-btn ${this.isListening ? 'listening' : ''}"
+                    @click=${this.handleTalkClick}
+                    title="Push to talk — click to start, click again to send"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                        <line x1="12" y1="19" x2="12" y2="23" />
+                    </svg>
+                    ${this.isListening ? 'Listening… tap to send' : 'Talk'}
+                </button>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">

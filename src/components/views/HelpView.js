@@ -126,11 +126,14 @@ export class HelpView extends LitElement {
             moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
             toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
             toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
+            toggleAudioMute: isMac ? 'Cmd+Shift+M' : 'Ctrl+Shift+M',
             nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
             previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
             nextResponse: isMac ? 'Cmd+]' : 'Ctrl+]',
             scrollUp: isMac ? 'Cmd+Shift+Up' : 'Ctrl+Shift+Up',
             scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
+            pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
+            answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
         };
     }
 
@@ -150,6 +153,9 @@ export class HelpView extends LitElement {
             ['Move Window Right', this.keybinds.moveRight],
             ['Toggle Visibility', this.keybinds.toggleVisibility],
             ['Toggle Click-through', this.keybinds.toggleClickThrough],
+            ['Mute / Resume Listening', this.keybinds.toggleAudioMute],
+            ['Ask by Voice (Push-to-talk)', this.keybinds.pushToTalk],
+            ['Answer With Context', this.keybinds.answerWithContext],
             ['Ask Next Step', this.keybinds.nextStep],
             ['Previous Response', this.keybinds.previousResponse],
             ['Next Response', this.keybinds.nextResponse],

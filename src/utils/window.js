@@ -102,6 +102,7 @@ function getDefaultKeybinds() {
         moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
         toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
         toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
+        toggleAudioMute: isMac ? 'Cmd+Shift+M' : 'Ctrl+Shift+M',
         nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
         previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
         nextResponse: isMac ? 'Cmd+]' : 'Ctrl+]',
@@ -110,6 +111,8 @@ function getDefaultKeybinds() {
         emergencyErase: isMac ? 'Cmd+Shift+E' : 'Ctrl+Shift+E',
         analyzeScreen: isMac ? 'Cmd+Shift+S' : 'Ctrl+Shift+S',
         searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
+        pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
+        answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
     };
 }
 
@@ -256,6 +259,19 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
         }
     }
 
+    // Register toggle audio mute (pause/resume listening) shortcut
+    if (keybinds.toggleAudioMute) {
+        try {
+            globalShortcut.register(keybinds.toggleAudioMute, () => {
+                console.log('Toggle audio mute shortcut triggered');
+                sendToRenderer('audio-mute-shortcut');
+            });
+            console.log(`Registered toggleAudioMute: ${keybinds.toggleAudioMute}`);
+        } catch (error) {
+            console.error(`Failed to register toggleAudioMute (${keybinds.toggleAudioMute}):`, error);
+        }
+    }
+
     // Register next step shortcut (either starts session or takes screenshot based on view)
     if (keybinds.nextStep) {
         try {
@@ -383,6 +399,65 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             console.log(`Registered searchSelection: ${keybinds.searchSelection}`);
         } catch (error) {
             console.error(`Failed to register searchSelection (${keybinds.searchSelection}):`, error);
+        }
+    }
+
+    // Register push-to-talk shortcut (ask a question by voice; shows window if hidden)
+    if (keybinds.pushToTalk) {
+        try {
+            globalShortcut.register(keybinds.pushToTalk, () => {
+                console.log('Push-to-talk shortcut triggered');
+                try {
+                    if (!mainWindow.isVisible()) {
+                        mainWindow.showInactive();
+                    }
+                    sendToRenderer('push-to-talk-shortcut');
+                } catch (error) {
+                    console.error('Error handling push-to-talk shortcut:', error);
+                }
+            });
+            if (globalShortcut.isRegistered(keybinds.pushToTalk)) {
+                console.log(`Registered pushToTalk: ${keybinds.pushToTalk}`);
+            } else {
+                console.warn(
+                    `Could not register pushToTalk (${keybinds.pushToTalk}) — likely taken by another app. Rebind it in Customize.`
+                );
+                sendToRenderer(
+                    'update-status',
+                    `Push-to-talk shortcut ${keybinds.pushToTalk} is unavailable (in use by another app) — rebind it in Customize.`
+                );
+            }
+        } catch (error) {
+            console.error(`Failed to register pushToTalk (${keybinds.pushToTalk}):`, error);
+        }
+    }
+
+    // Register answer-with-context shortcut: force Claude to answer the recently
+    // heard speech (even if it was out of context / not auto-answered).
+    if (keybinds.answerWithContext) {
+        try {
+            globalShortcut.register(keybinds.answerWithContext, () => {
+                console.log('Answer-with-context shortcut triggered');
+                try {
+                    if (!mainWindow.isVisible()) {
+                        mainWindow.showInactive();
+                    }
+                    sendToRenderer('answer-with-context-shortcut');
+                } catch (error) {
+                    console.error('Error handling answer-with-context shortcut:', error);
+                }
+            });
+            // register() returns false (no throw) when another app already owns
+            // the combo — surface that so it isn't silently dead.
+            if (globalShortcut.isRegistered(keybinds.answerWithContext)) {
+                console.log(`Registered answerWithContext: ${keybinds.answerWithContext}`);
+            } else {
+                console.warn(
+                    `Could not register answerWithContext (${keybinds.answerWithContext}) — likely taken by another app. Rebind it in Customize.`
+                );
+            }
+        } catch (error) {
+            console.error(`Failed to register answerWithContext (${keybinds.answerWithContext}):`, error);
         }
     }
 

@@ -17,14 +17,25 @@ let speechBuffers = [];
 let silenceFrameCount = 0;
 let speechFrameCount = 0;
 
+// Circular buffer of the last N frames before VAD confirms speech.
+// Prepended when speech starts so Whisper sees audio context before the first word
+// rather than a cold start mid-utterance (which triggers hallucinations in tiny model).
+const PRE_SPEECH_FRAMES = 8;
+let preSpeechBuffer = [];
+
 // VAD configuration
 const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
     LOW_BITRATE: { energyThreshold: 0.008, speechFramesRequired: 4, silenceFramesRequired: 35 },
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
     VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 3 },
+    // Each VAD frame is ~0.1s. A ~1.0s end-of-utterance silence lets a full
+    // sentence accumulate before transcription instead of being chopped into
+    // short fragments — Whisper (especially the tiny model) is far more
+    // accurate with complete-utterance context.
+    BALANCED: { energyThreshold: 0.01, speechFramesRequired: 2, silenceFramesRequired: 10 },
 };
-let vadConfig = VAD_MODES.VERY_AGGRESSIVE;
+let vadConfig = VAD_MODES.BALANCED;
 
 // Audio resampling buffer
 let resampleRemainder = Buffer.alloc(0);
@@ -82,11 +93,31 @@ function processVAD(pcm16kBuffer) {
 
         if (!isSpeaking && speechFrameCount >= vadConfig.speechFramesRequired) {
             isSpeaking = true;
-            speechBuffers = [];
-            console.log('[Transcriber] Speech started (RMS:', rms.toFixed(4), ')');
+            // preSpeechBuffer already contains recent silence + the confirmation frames
+            speechBuffers = preSpeechBuffer.map(b => Buffer.from(b));
+            preSpeechBuffer = [];
+            console.log('[Transcriber] Speech started (RMS:', rms.toFixed(4), ', pre-speech frames:', speechBuffers.length, ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
+
+        // Buffer voice frames during the confirmation window too — once confirmed
+        // they're already in speechBuffers via the seed above, so only buffer while
+        // isSpeaking is still false.
+        if (!isSpeaking) {
+            preSpeechBuffer.push(Buffer.from(pcm16kBuffer));
+            if (preSpeechBuffer.length > PRE_SPEECH_FRAMES) {
+                preSpeechBuffer.shift();
+            }
+        }
     } else {
+        // While not speaking, maintain a rolling window of recent audio
+        if (!isSpeaking) {
+            preSpeechBuffer.push(Buffer.from(pcm16kBuffer));
+            if (preSpeechBuffer.length > PRE_SPEECH_FRAMES) {
+                preSpeechBuffer.shift();
+            }
+        }
+
         silenceFrameCount++;
         speechFrameCount = 0;
 
@@ -111,6 +142,23 @@ function processVAD(pcm16kBuffer) {
 
 // ── Whisper Transcription ──
 
+// The right dtype depends on the model. A flat q8 works for the small Xenova
+// models, but the large-v3-turbo ONNX build ships separate encoder/decoder
+// graphs that must be selected individually:
+//   - encoder: fp32. The q8 encoder's quantized kernels (e.g. BiasGelu) crash
+//     onnxruntime-node with a SIGTRAP from libmalloc mid-inference. fp32 is
+//     HuggingFace's documented config for this model and is stable; at ~1.2GB
+//     it's fine on any machine with a few GB of free RAM.
+//   - decoder: q8. The q4 variant relies on MatMulNBits and ships as a fragile
+//     320MB file that fails to parse if a download is interrupted; standard q8
+//     quantization is well-tested and roughly halves the decoder's footprint.
+function getDtypeForModel(modelName) {
+    if (/whisper-large-v3-turbo/i.test(modelName)) {
+        return { encoder_model: 'fp32', decoder_model_merged: 'q8' };
+    }
+    return 'q8';
+}
+
 async function loadWhisperPipeline(modelName) {
     if (whisperPipeline) return whisperPipeline;
     if (isWhisperLoading) return null;
@@ -128,10 +176,23 @@ async function loadWhisperPipeline(modelName) {
         const path = require('path');
         env.cacheDir = path.join(app.getPath('userData'), 'whisper-models');
         whisperPipeline = await pipeline('automatic-speech-recognition', modelName, {
-            dtype: 'q8',
-            device: 'auto',
+            device: 'cpu',
+            dtype: getDtypeForModel(modelName),
         });
         console.log('[Transcriber] Whisper model loaded successfully');
+
+        // Warm up the ONNX graph with a throwaway inference. The first real
+        // inference otherwise pays one-time kernel/graph allocation, making the
+        // user's first question feel 2-5x slower than steady state. 1s of
+        // silence is enough to compile the encoder/decoder path.
+        try {
+            const warmStart = Date.now();
+            await whisperPipeline(new Float32Array(16000), { sampling_rate: 16000, language: 'en', task: 'transcribe' });
+            console.log(`[Transcriber] Warmup completed in ${Date.now() - warmStart}ms`);
+        } catch (warmupError) {
+            console.warn('[Transcriber] Warmup inference failed (non-fatal):', warmupError.message);
+        }
+
         sendToRenderer('whisper-downloading', false);
         isWhisperLoading = false;
         return whisperPipeline;
@@ -255,10 +316,30 @@ function processAudio24k(monoChunk24k) {
     }
 }
 
+// Force-transcribe whatever speech has been buffered, even if the VAD has not
+// yet seen the trailing end-of-utterance silence. Used by push-to-talk so the
+// final words are sent the instant the user stops listening.
+function flush() {
+    if (speechBuffers.length === 0) {
+        isSpeaking = false;
+        silenceFrameCount = 0;
+        speechFrameCount = 0;
+        return false;
+    }
+    const audioData = Buffer.concat(speechBuffers);
+    speechBuffers = [];
+    isSpeaking = false;
+    silenceFrameCount = 0;
+    speechFrameCount = 0;
+    queueTranscription(audioData);
+    return true;
+}
+
 function resetTranscriber() {
     transcriptionGeneration++;
     isSpeaking = false;
     speechBuffers = [];
+    preSpeechBuffer = [];
     silenceFrameCount = 0;
     speechFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
@@ -271,5 +352,6 @@ module.exports = {
     initWhisper,
     setOnTranscript,
     processAudio24k,
+    flush,
     resetTranscriber,
 };

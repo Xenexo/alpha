@@ -298,6 +298,7 @@ export class CustomizeView extends LitElement {
             moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
             toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
             toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
+            toggleAudioMute: isMac ? 'Cmd+Shift+M' : 'Ctrl+Shift+M',
             nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
             previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
             nextResponse: isMac ? 'Cmd+]' : 'Ctrl+]',
@@ -305,6 +306,8 @@ export class CustomizeView extends LitElement {
             scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
             analyzeScreen: isMac ? 'Cmd+Shift+S' : 'Ctrl+Shift+S',
             searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
+            pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
+            answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
         };
     }
 
@@ -316,6 +319,7 @@ export class CustomizeView extends LitElement {
             { key: 'moveRight', name: 'Move Window Right', description: 'Move the app window right' },
             { key: 'toggleVisibility', name: 'Toggle Visibility', description: 'Show or hide the app window' },
             { key: 'toggleClickThrough', name: 'Toggle Click-through', description: 'Enable or disable click-through mode' },
+            { key: 'toggleAudioMute', name: 'Mute / Resume Listening', description: 'Pause or resume audio listening during a session' },
             { key: 'nextStep', name: 'Ask Next Step', description: 'Take screenshot and ask for next step' },
             { key: 'previousResponse', name: 'Previous Response', description: 'Move to previous AI response' },
             { key: 'nextResponse', name: 'Next Response', description: 'Move to next AI response' },
@@ -323,6 +327,8 @@ export class CustomizeView extends LitElement {
             { key: 'scrollDown', name: 'Scroll Response Down', description: 'Scroll response content downward' },
             { key: 'analyzeScreen', name: 'Analyze Screen Now', description: 'Capture screen and ask the AI immediately, from anywhere' },
             { key: 'searchSelection', name: 'Ask About Selected Text', description: 'Copy current selection in any app and send it to the AI' },
+            { key: 'pushToTalk', name: 'Ask by Voice (Push-to-talk)', description: 'Press to start listening to your mic, press again to send what you said as a question' },
+            { key: 'answerWithContext', name: 'Answer With Context', description: 'Make Claude answer the recently heard speech using the conversation context, even if it was not auto-answered (Claude only)' },
         ];
     }
 

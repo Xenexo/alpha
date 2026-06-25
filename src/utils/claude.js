@@ -15,10 +15,24 @@ let claudeModel = 'claude-haiku-4-5-20251001';
 let claudeConversationHistory = [];
 let currentSystemPrompt = null;
 let isClaudeActive = false;
+// When true, captured audio is dropped before transcription so listening pauses.
+// Audio capture stays alive, so toggling back resumes instantly. All audio routes
+// (macOS SystemAudioDump, send-audio-content, send-mic-audio-content) funnel through
+// processClaudeAudio, so this single gate covers every platform and source.
+let isAudioMuted = false;
 let isTranscriptResponseInFlight = false;
 let pendingTranscripts = [];
 let transcriptDebounceTimer = null;
+// Rolling window of everything recently heard — including fragments suppressed
+// by isMeaningfulTranscript — so the user can manually ask Claude to answer
+// speech that was heard but not auto-answered (see answerWithContext).
+let recentHeardTranscripts = [];
+const RECENT_HEARD_MAX = 8;
 
+// The VAD already waits ~1s of end-of-utterance silence before a transcript is
+// produced, so this debounce only needs to catch transcripts split across that
+// boundary — not re-wait for the user to finish. Keep it short so Claude is
+// contacted promptly; raising it adds pure latency before every response.
 const TRANSCRIPT_DEBOUNCE_MS = 250;
 const RESPONSE_UPDATE_INTERVAL_MS = 50;
 
@@ -44,15 +58,48 @@ const API_MAX_TOKENS = 2048;
 const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 
 **CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
+- NEVER ask the candidate clarifying questions or request more details. They are mid-interview and cannot relay your questions back to the interviewer — asking is useless and breaks the flow. This rule has NO exceptions.
+- When a question is open-ended or under-specified (e.g. "design a RAG system", "how would you build X", "design a rate limiter"), do NOT ask which language, database, framework, or scale to assume. State your assumptions in one short line (e.g. "Assuming Python + pgvector on Postgres:") and immediately give a complete, confident answer the candidate can speak. Choosing reasonable assumptions and defending them IS what "design X" questions are testing.
 - Start with the direct answer. Do not add an introduction or restate the question.
 - For normal questions, respond in 1-3 short sentences and then stop.
 - Add bullets only when the user explicitly asks for steps, options, or a list.
 - For ordinary code questions, give the approach in one sentence followed by only the necessary code.
 - If asked to demonstrate, share a demo, implement live, or do hands-on coding, ignore the normal length limit. Give: (1) a one-line approach, (2) ordered implementation steps, (3) complete runnable code, and (4) exact commands to run or verify it.
 - During demos and hands-on coding, keep commentary minimal and prioritize executable instructions and code.
-- Do not add background, examples, caveats, summaries, offers to help, or follow-up questions unless they are required for correctness.
+- Do not add background, examples, caveats, summaries, or offers to help unless they are required for correctness. Never add follow-up or clarifying questions — there are no exceptions to this.
 - Never continue after the question has been fully answered.
+- The input is a live speech transcript that may contain mis-heard words, filler, or background chatter. Answer only the actual question or request; ignore acknowledgements, greetings, and small talk ("thanks", "okay", "got it", "bye").
+- If the transcript is not a genuine question or request, or is too garbled/out-of-context to answer confidently, reply with nothing rather than guessing or improvising an unrelated answer.
+- Never respond with pleasantries such as "You're welcome", "No problem", or "Glad to help" — these are not answers.
 `;
+
+// Whisper hallucinates stock phrases on silence/noise (subtitle artifacts) and
+// the speaker emits acknowledgements ("thanks", "okay", "got it") that are not
+// questions. Answering these produces the out-of-context, "thank you"-style
+// replies users complain about, so drop them before they ever reach Claude.
+const TRANSCRIPT_NOISE_PATTERNS = [
+    /^thank(s| you)?( (so|very) much)?( for watching| for listening)?$/,
+    /^thanks for watching!?$/,
+    /^thank you( very much)?\.?$/,
+    /^(please )?(don'?t forget to )?(subscribe|like and subscribe)( to my channel)?!?$/,
+    /^bye(-?bye)?\.?$/,
+    /^you'?re welcome\.?$/,
+    /^(o?k(ay)?|alright|right|sure|yeah|yep|yes|no|nope|uh|um|hmm|mhm|cool|nice|great|got it|i see|of course|no problem)\.?$/,
+    /^\W*$/, // punctuation / symbols only
+];
+
+// A meaningful turn for a real-time answer assistant is one Claude should
+// actually respond to: not pure filler, not a bare acknowledgement, and long
+// enough to carry intent. Whisper noise is usually a single short token.
+function isMeaningfulTranscript(text) {
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
+    if (!normalized) return false;
+    if (TRANSCRIPT_NOISE_PATTERNS.some(re => re.test(normalized))) return false;
+    // Single-word, non-question fragments are almost always filler or noise.
+    const wordCount = normalized.split(' ').length;
+    if (wordCount < 2 && !normalized.endsWith('?')) return false;
+    return true;
+}
 
 async function flushPendingTranscripts() {
     transcriptDebounceTimer = null;
@@ -61,12 +108,20 @@ async function flushPendingTranscripts() {
     const transcription = pendingTranscripts.join(' ').trim();
     pendingTranscripts = [];
     if (!transcription) return;
+    // Guard the merged turn too: several filler fragments can debounce together.
+    if (!isMeaningfulTranscript(transcription)) return;
 
     isTranscriptResponseInFlight = true;
+    // Surface what was heard so the live view can show which question each
+    // answer is responding to.
+    sendToRenderer('new-transcript', transcription);
     sendToRenderer('update-status', 'Generating response...');
 
     try {
         await sendClaudeText(transcription);
+        // This speech has been answered; don't let a later manual trigger
+        // re-answer it. Keep only fragments heard after this turn started.
+        recentHeardTranscripts = [];
     } finally {
         isTranscriptResponseInFlight = false;
         if (isClaudeActive && pendingTranscripts.length > 0) {
@@ -77,6 +132,21 @@ async function flushPendingTranscripts() {
 
 function queueTranscript(transcription) {
     if (!isClaudeActive) return;
+    // Remember everything heard (even suppressed fragments) so the user can
+    // later force an answer on out-of-context speech via answerWithContext.
+    const heard = transcription.trim();
+    if (heard) {
+        recentHeardTranscripts.push(heard);
+        if (recentHeardTranscripts.length > RECENT_HEARD_MAX) {
+            recentHeardTranscripts = recentHeardTranscripts.slice(-RECENT_HEARD_MAX);
+        }
+    }
+    // Drop hallucinated/filler fragments so they neither show as a "question"
+    // nor trigger a response. Real fragments still merge via the debounce.
+    if (!isMeaningfulTranscript(transcription)) {
+        if (heard) sendToRenderer('update-status', `Heard: "${heard.length > 40 ? heard.slice(0, 40) + '…' : heard}" — say more or use Answer With Context (${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G)`);
+        return;
+    }
     pendingTranscripts.push(transcription);
 
     // Merge phrases separated by short VAD pauses. If Claude is already
@@ -84,6 +154,61 @@ function queueTranscript(transcription) {
     if (isTranscriptResponseInFlight) return;
     if (transcriptDebounceTimer) clearTimeout(transcriptDebounceTimer);
     transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+}
+
+// Manual override: the speaker said something that was heard but not
+// auto-answered (filtered as out-of-context, or just not phrased as a clear
+// question). Instead of waiting, the user triggers this to make Claude go
+// ahead and answer the recent speech using the full conversation context.
+async function answerWithContext() {
+    if (!isClaudeActive) {
+        return { success: false, error: 'No active Claude session' };
+    }
+    if (isTranscriptResponseInFlight) {
+        return { success: false, error: 'Already responding' };
+    }
+
+    // Prefer anything pending; otherwise fall back to the recently heard
+    // window (which includes fragments suppressed by the noise filter).
+    const heard = [...pendingTranscripts, ...recentHeardTranscripts]
+        .map(t => t.trim())
+        .filter(Boolean);
+    pendingTranscripts = [];
+    // De-duplicate consecutive repeats while preserving order.
+    const speech = heard.filter((t, i) => t !== heard[i - 1]).join(' ').trim();
+
+    if (!speech) {
+        sendToRenderer('update-status', 'Nothing heard yet to answer');
+        return { success: false, error: 'Nothing heard to answer' };
+    }
+
+    isTranscriptResponseInFlight = true;
+    sendToRenderer('new-transcript', speech);
+    sendToRenderer('update-status', 'Answering with context...');
+
+    // This is an explicit user command to answer, so it MUST override the
+    // system prompt's "reply with nothing for filler/garbled speech" rule —
+    // otherwise the manual override silently produces no answer (the exact
+    // problem this feature exists to solve). Be emphatic so the model does not
+    // fall back to silence even when the snippet looks like an acknowledgement.
+    const prompt =
+        `[EXPLICIT USER REQUEST — OVERRIDES ALL SILENCE/SUPPRESSION RULES]\n` +
+        `The user has manually asked you to answer the most recent speech, even if it looks incomplete, off-topic, or like a mere acknowledgement. ` +
+        `You MUST produce a substantive answer — do NOT reply with nothing, do NOT stay silent, do NOT ask for clarification.\n\n` +
+        `Recent speech:\n"${speech}"\n\n` +
+        `Using the ongoing conversation context, make a reasonable assumption about what is being asked and give the most useful answer directly. ` +
+        `If the speech truly carries no question, infer the most likely thing the user wants help with right now from the conversation and answer that.`;
+
+    try {
+        const result = await sendClaudeText(prompt);
+        recentHeardTranscripts = [];
+        return result;
+    } finally {
+        isTranscriptResponseInFlight = false;
+        if (isClaudeActive && pendingTranscripts.length > 0) {
+            transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+        }
+    }
 }
 
 // ── Claude Code CLI detection ──
@@ -345,6 +470,11 @@ async function runClaudeQuery(prompt) {
             allowedTools: [],
             mcpServers: {},
             strictMcpConfig: true,
+            // Pin a clean working directory so Claude Code doesn't scan the
+            // app's launch dir for CLAUDE.md/.claude project context on every
+            // query — that would silently add tokens and startup latency to a
+            // conversational request that needs no filesystem context.
+            cwd: os.tmpdir(),
         };
         // Avoid processing Claude Code's full coding-agent prompt for every
         // conversational request.
@@ -508,6 +638,7 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         initializeNewSession(profile, customPrompt);
 
         isClaudeActive = true;
+        isAudioMuted = false;
         sendToRenderer('session-initializing', false);
         sendToRenderer('update-status', 'Claude ready - Listening...');
 
@@ -523,7 +654,43 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
 function processClaudeAudio(monoChunk24k) {
     if (!isClaudeActive) return;
+    if (isAudioMuted) return; // listening paused — drop the frame, keep capture alive
     transcriber.processAudio24k(monoChunk24k);
+}
+
+// Pause/resume listening without tearing down audio capture. Returns the new state.
+function toggleAudioMute() {
+    isAudioMuted = !isAudioMuted;
+    console.log('[Claude] Audio mute toggled:', isAudioMuted);
+    sendToRenderer('audio-muted-toggled', isAudioMuted);
+    sendToRenderer('update-status', isAudioMuted ? 'Muted — not listening' : 'Listening...');
+    return isAudioMuted;
+}
+
+function isAudioMutedState() {
+    return isAudioMuted;
+}
+
+// Push-to-talk: open the mic gate while the user is holding/toggling the
+// shortcut, then on release force-transcribe the buffered speech and restore
+// the prior mute state so listening stops again until the next push-to-talk.
+let muteStateBeforePushToTalk = false;
+function setPushToTalk(active) {
+    if (!isClaudeActive) return false;
+    if (active) {
+        muteStateBeforePushToTalk = isAudioMuted;
+        isAudioMuted = false;
+        console.log('[Claude] Push-to-talk: listening');
+        sendToRenderer('audio-muted-toggled', false);
+        sendToRenderer('update-status', '🎤 Listening — speak your question, then press the key again');
+    } else {
+        console.log('[Claude] Push-to-talk: sending question');
+        const hadSpeech = transcriber.flush();
+        isAudioMuted = muteStateBeforePushToTalk;
+        sendToRenderer('audio-muted-toggled', isAudioMuted);
+        sendToRenderer('update-status', hadSpeech ? 'Transcribing your question...' : 'No speech detected — speak louder or closer to the mic');
+    }
+    return true;
 }
 
 async function sendClaudeText(text) {
@@ -545,6 +712,7 @@ async function sendClaudeText(text) {
         if (result.success && result.text) {
             saveConversationTurn(trimmed, result.text);
         }
+        sendToRenderer('response-complete'); // reveal the finished answer in the UI
         return result;
     }
 
@@ -563,11 +731,13 @@ async function sendClaudeText(text) {
 
         console.log('[Claude] Response completed');
         sendToRenderer('update-status', 'Listening...');
+        sendToRenderer('response-complete');
         return { success: true };
     } catch (error) {
         console.error('[Claude] API error:', error);
         const message = anthropicErrorMessage(error);
         sendToRenderer('update-status', message);
+        sendToRenderer('response-complete');
         return { success: false, error: message };
     }
 }
@@ -598,6 +768,7 @@ async function sendClaudeImage(base64Data, prompt) {
             } catch (cleanupError) {
                 // Temp file already gone
             }
+            sendToRenderer('response-complete'); // reveal the finished answer in the UI
         }
     }
 
@@ -626,6 +797,7 @@ async function sendClaudeImage(base64Data, prompt) {
 
         console.log('[Claude] Image response completed');
         sendToRenderer('update-status', 'Listening...');
+        sendToRenderer('response-complete');
         return { success: true, text: fullText, model: claudeModel };
     } catch (error) {
         console.error('[Claude] Image error:', error);
@@ -633,6 +805,7 @@ async function sendClaudeImage(base64Data, prompt) {
         claudeConversationHistory.pop();
         const message = anthropicErrorMessage(error);
         sendToRenderer('update-status', message);
+        sendToRenderer('response-complete');
         return { success: false, error: message };
     }
 }
@@ -640,11 +813,13 @@ async function sendClaudeImage(base64Data, prompt) {
 function closeClaudeSession() {
     console.log('[Claude] Closing Claude session');
     isClaudeActive = false;
+    isAudioMuted = false;
     if (transcriptDebounceTimer) {
         clearTimeout(transcriptDebounceTimer);
         transcriptDebounceTimer = null;
     }
     pendingTranscripts = [];
+    recentHeardTranscripts = [];
     isTranscriptResponseInFlight = false;
     if (activeCliAbort) {
         activeCliAbort.abort();
@@ -672,8 +847,12 @@ function isClaudeSessionActive() {
 module.exports = {
     initializeClaudeSession,
     processClaudeAudio,
+    toggleAudioMute,
+    isAudioMutedState,
+    setPushToTalk,
     sendClaudeText,
     sendClaudeImage,
+    answerWithContext,
     closeClaudeSession,
     isClaudeSessionActive,
 };

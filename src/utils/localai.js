@@ -10,6 +10,8 @@ let ollamaModel = null;
 let localConversationHistory = [];
 let currentSystemPrompt = null;
 let isLocalActive = false;
+let isAudioMuted = false;
+let muteStateBeforePushToTalk = false;
 
 // ── Ollama Chat ──
 
@@ -134,12 +136,31 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
 
 function processLocalAudio(monoChunk24k) {
     if (!isLocalActive) return;
+    if (isAudioMuted) return; // listening paused — drop the frame, keep capture alive
     transcriber.processAudio24k(monoChunk24k);
+}
+
+// Push-to-talk: open the mic gate while listening, then on release
+// force-transcribe the buffered speech and restore the prior mute state.
+function setPushToTalk(active) {
+    if (!isLocalActive) return false;
+    if (active) {
+        muteStateBeforePushToTalk = isAudioMuted;
+        isAudioMuted = false;
+        sendToRenderer('update-status', '🎤 Listening — speak your question, then press the key again');
+    } else {
+        const hadSpeech = transcriber.flush();
+        isAudioMuted = muteStateBeforePushToTalk;
+        sendToRenderer('audio-muted-toggled', isAudioMuted);
+        sendToRenderer('update-status', hadSpeech ? 'Transcribing your question...' : 'No speech detected — speak louder or closer to the mic');
+    }
+    return true;
 }
 
 function closeLocalSession() {
     console.log('[LocalAI] Closing local session');
     isLocalActive = false;
+    isAudioMuted = false;
     transcriber.resetTranscriber();
     localConversationHistory = [];
     ollamaClient = null;
@@ -230,6 +251,7 @@ async function sendLocalImage(base64Data, prompt) {
 module.exports = {
     initializeLocalSession,
     processLocalAudio,
+    setPushToTalk,
     closeLocalSession,
     isLocalSessionActive,
     sendLocalText,

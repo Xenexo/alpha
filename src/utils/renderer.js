@@ -2,10 +2,13 @@
 const { ipcRenderer } = require('electron');
 
 let mediaStream = null;
+let micMediaStream = null;
 let screenshotInterval = null;
 let audioContext = null;
 let audioProcessor = null;
 let micAudioProcessor = null;
+let pushToTalkActive = false;
+let pushToTalkStartedMic = false;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
 const AUDIO_CHUNK_DURATION = 0.1; // seconds
@@ -221,6 +224,46 @@ ipcRenderer.on('update-status', (event, status) => {
     cheatingDaddy.setStatus(status);
 });
 
+// Start microphone capture and route it through the transcription pipeline.
+// Safe to call repeatedly — it no-ops if the mic is already running. Returns
+// true on success. The mic is push-to-talk only: it is opened on demand by
+// push-to-talk and released afterward, never continuously at session start.
+async function startMicCapture() {
+    if (micAudioProcessor) return true; // already capturing
+    try {
+        const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                sampleRate: SAMPLE_RATE,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
+            video: false,
+        });
+        micMediaStream = micStream;
+        setupLinuxMicProcessing(micStream);
+        console.log('Microphone capture started');
+        return true;
+    } catch (micError) {
+        console.warn('Failed to get microphone access:', micError);
+        return false;
+    }
+}
+
+// Tear down microphone capture (used when push-to-talk started the mic on
+// demand and should release it again afterwards).
+function stopMicCapture() {
+    if (micAudioProcessor) {
+        micAudioProcessor.disconnect();
+        micAudioProcessor = null;
+    }
+    if (micMediaStream) {
+        micMediaStream.getTracks().forEach(track => track.stop());
+        micMediaStream = null;
+    }
+}
+
 async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'medium') {
     // Store the image quality for manual screenshots
     currentImageQuality = imageQuality;
@@ -253,25 +296,9 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
             console.log('macOS screen capture started - audio handled by SystemAudioDump');
 
-            if (audioMode === 'mic_only' || audioMode === 'both') {
-                let micStream = null;
-                try {
-                    micStream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            sampleRate: SAMPLE_RATE,
-                            channelCount: 1,
-                            echoCancellation: true,
-                            noiseSuppression: true,
-                            autoGainControl: true,
-                        },
-                        video: false,
-                    });
-                    console.log('macOS microphone capture started');
-                    setupLinuxMicProcessing(micStream);
-                } catch (micError) {
-                    console.warn('Failed to get microphone access on macOS:', micError);
-                }
-            }
+            // Mic is push-to-talk only: it stays off until the user presses
+            // push-to-talk, then is released again. It is never opened
+            // continuously at session start, regardless of audio mode.
         } else if (isLinux) {
             // Linux - use display media for screen capture and try to get system audio
             try {
@@ -309,31 +336,7 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                 });
             }
 
-            // Additionally get microphone input for Linux based on audio mode
-            if (audioMode === 'mic_only' || audioMode === 'both') {
-                let micStream = null;
-                try {
-                    micStream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            sampleRate: SAMPLE_RATE,
-                            channelCount: 1,
-                            echoCancellation: true,
-                            noiseSuppression: true,
-                            autoGainControl: true,
-                        },
-                        video: false,
-                    });
-
-                    console.log('Linux microphone capture started');
-
-                    // Setup audio processing for microphone on Linux
-                    setupLinuxMicProcessing(micStream);
-                } catch (micError) {
-                    console.warn('Failed to get microphone access on Linux:', micError);
-                    // Continue without microphone if permission denied
-                }
-            }
-
+            // Mic is push-to-talk only: not opened continuously here.
             console.log('Linux capture started - system audio:', mediaStream.getAudioTracks().length > 0, 'microphone mode:', audioMode);
         } else {
             // Windows - use display media with loopback for system audio
@@ -357,25 +360,7 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             // Setup audio processing for Windows loopback audio only
             setupWindowsLoopbackProcessing();
 
-            if (audioMode === 'mic_only' || audioMode === 'both') {
-                let micStream = null;
-                try {
-                    micStream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            sampleRate: SAMPLE_RATE,
-                            channelCount: 1,
-                            echoCancellation: true,
-                            noiseSuppression: true,
-                            autoGainControl: true,
-                        },
-                        video: false,
-                    });
-                    console.log('Windows microphone capture started');
-                    setupLinuxMicProcessing(micStream);
-                } catch (micError) {
-                    console.warn('Failed to get microphone access on Windows:', micError);
-                }
-            }
+            // Mic is push-to-talk only: not opened continuously here.
         }
 
         console.log('MediaStream obtained:', {
@@ -707,11 +692,12 @@ function stopCapture() {
         audioProcessor = null;
     }
 
-    // Clean up microphone audio processor (Linux only)
-    if (micAudioProcessor) {
-        micAudioProcessor.disconnect();
-        micAudioProcessor = null;
-    }
+    // Clean up microphone audio processor and its stream
+    stopMicCapture();
+
+    pushToTalkActive = false;
+    pushToTalkStartedMic = false;
+    emitPushToTalkState(false);
 
     if (audioContext) {
         audioContext.close();
@@ -826,6 +812,88 @@ function handleShortcut(shortcutKey) {
         captureManualScreenshot();
     }
 }
+
+// Notify the UI (e.g. the push-to-talk button) whenever listening starts or
+// stops, so it stays in sync regardless of whether it was toggled by the button
+// or the global keyboard shortcut.
+function emitPushToTalkState(active) {
+    window.dispatchEvent(new CustomEvent('push-to-talk-changed', { detail: { active } }));
+}
+
+// Push-to-talk: ask a question by voice via the global shortcut or the on-screen
+// button. Because Electron global shortcuts only fire on key-down (no reliable
+// key-up), this is a toggle — first press starts listening to the mic, second
+// press sends what was heard as a question to the assistant.
+async function togglePushToTalk() {
+    console.log('[PushToTalk] toggle requested, active=', pushToTalkActive, 'hasSession=', !!mediaStream);
+    if (!mediaStream) {
+        cheatingDaddy.setStatus('Start a session first');
+        return;
+    }
+
+    if (!pushToTalkActive) {
+        // Begin listening — make sure the mic is actually capturing first.
+        const micWasRunning = !!micAudioProcessor;
+        const micOk = await startMicCapture();
+        if (!micOk) {
+            cheatingDaddy.setStatus('Microphone access denied — enable it in System Settings');
+            return;
+        }
+        const result = await ipcRenderer.invoke('set-push-to-talk', true);
+        if (!result || !result.success) {
+            // Provider doesn't support push-to-talk (e.g. live Gemini) — undo any
+            // mic we just started so we don't leave it running.
+            if (!micWasRunning) stopMicCapture();
+            cheatingDaddy.setStatus((result && result.error) || 'Push-to-talk unavailable');
+            return;
+        }
+        // Only release the mic afterwards if push-to-talk is the one that opened it.
+        pushToTalkStartedMic = !micWasRunning;
+        pushToTalkActive = true;
+        emitPushToTalkState(true);
+    } else {
+        // Stop listening and send the captured speech as a question.
+        pushToTalkActive = false;
+        emitPushToTalkState(false);
+        const result = await ipcRenderer.invoke('set-push-to-talk', false);
+        if (!result || !result.success) {
+            cheatingDaddy.setStatus((result && result.error) || 'Push-to-talk unavailable');
+        }
+        // Release the mic if we started it for this push-to-talk turn. The buffered
+        // speech was already force-transcribed in the main process above.
+        if (pushToTalkStartedMic) stopMicCapture();
+        pushToTalkStartedMic = false;
+    }
+}
+
+// Triggered by the global push-to-talk shortcut (main process)
+ipcRenderer.on('push-to-talk-shortcut', () => {
+    console.log('[PushToTalk] shortcut received in renderer');
+    if (cheatingDaddy.getCurrentView() !== 'assistant' && cheatingDaddy.element()) {
+        cheatingDaddy.element().currentView = 'assistant';
+    }
+    togglePushToTalk();
+});
+
+// Triggered by the global answer-with-context shortcut (main process): force a
+// response to recently heard speech that wasn't auto-answered.
+ipcRenderer.on('answer-with-context-shortcut', async () => {
+    if (!mediaStream) {
+        cheatingDaddy.setStatus('Start a session first');
+        return;
+    }
+    if (cheatingDaddy.getCurrentView() !== 'assistant' && cheatingDaddy.element()) {
+        cheatingDaddy.element().currentView = 'assistant';
+    }
+    try {
+        const result = await ipcRenderer.invoke('answer-with-context');
+        if (result && !result.success && result.error) {
+            cheatingDaddy.setStatus(result.error);
+        }
+    } catch (error) {
+        console.error('Error invoking answer-with-context:', error);
+    }
+});
 
 // Selected text captured by the global shortcut (main process simulates copy)
 ipcRenderer.on('selection-captured', async (event, text) => {
@@ -1147,6 +1215,7 @@ const cheatingDaddy = {
     stopCapture,
     sendTextMessage,
     handleShortcut,
+    togglePushToTalk,
 
     // Storage API
     storage,

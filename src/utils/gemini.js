@@ -1160,6 +1160,20 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
+    // Manual override: force a response to recently heard speech that was not
+    // auto-answered (out of context / not a clear question), using context.
+    ipcMain.handle('answer-with-context', async () => {
+        if (currentProviderMode !== 'claude') {
+            return { success: false, error: 'Answer-with-context is only available with Claude' };
+        }
+        try {
+            return await getClaude().answerWithContext();
+        } catch (error) {
+            console.error('Error answering with context:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
     ipcMain.handle('start-macos-audio', async event => {
         if (process.platform !== 'darwin') {
             return {
@@ -1256,6 +1270,37 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             console.error('Error updating Google Search setting:', error);
             return { success: false, error: error.message };
         }
+    });
+
+    // Pause/resume listening (Claude mode only). The toggle drops captured audio
+    // before transcription while keeping capture alive for an instant resume.
+    ipcMain.handle('toggle-audio-mute', async () => {
+        if (currentProviderMode !== 'claude') {
+            return { success: false, error: 'Audio mute is only available in Claude mode' };
+        }
+        const muted = getClaude().toggleAudioMute();
+        return { success: true, muted };
+    });
+
+    ipcMain.handle('get-audio-mute', async () => {
+        const muted = currentProviderMode === 'claude' ? getClaude().isAudioMutedState() : false;
+        return { success: true, muted };
+    });
+
+    // Push-to-talk: open the mic gate while listening (active=true), then send
+    // the captured speech as a question on release (active=false). Available for
+    // the transcriber-backed providers (Claude, local). Live providers already
+    // stream the mic continuously, so push-to-talk is a no-op there.
+    ipcMain.handle('set-push-to-talk', async (event, active) => {
+        if (currentProviderMode === 'claude') {
+            const ok = getClaude().setPushToTalk(active);
+            return ok ? { success: true } : { success: false, error: 'No active Claude session' };
+        }
+        if (currentProviderMode === 'local') {
+            const ok = getLocalAi().setPushToTalk(active);
+            return ok ? { success: true } : { success: false, error: 'No active local session' };
+        }
+        return { success: false, error: 'Push-to-talk is available in Claude or Local AI mode' };
     });
 }
 

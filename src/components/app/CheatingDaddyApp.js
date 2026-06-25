@@ -322,6 +322,15 @@ export class CheatingDaddyApp extends LitElement {
             color: var(--text-primary);
         }
 
+        .live-bar-text.muted {
+            color: var(--error-color);
+        }
+
+        .live-bar-text.muted:hover {
+            color: var(--error-color);
+            opacity: 0.8;
+        }
+
         /* Content inner */
         .content-inner {
             flex: 1;
@@ -371,12 +380,15 @@ export class CheatingDaddyApp extends LitElement {
         selectedProfile: { type: String },
         selectedLanguage: { type: String },
         responses: { type: Array },
+        transcripts: { type: Array },
         currentResponseIndex: { type: Number },
         selectedScreenshotInterval: { type: String },
         selectedImageQuality: { type: String },
         layoutMode: { type: String },
         _viewInstances: { type: Object, state: true },
         _isClickThrough: { state: true },
+        _isAudioMuted: { state: true },
+        _isResponseStreaming: { state: true },
         _awaitingNewResponse: { state: true },
         shouldAnimateResponse: { type: Boolean },
         _storageLoaded: { state: true },
@@ -397,9 +409,12 @@ export class CheatingDaddyApp extends LitElement {
         this.selectedImageQuality = 'medium';
         this.layoutMode = 'normal';
         this.responses = [];
+        this.transcripts = [];
         this.currentResponseIndex = -1;
         this._viewInstances = new Map();
         this._isClickThrough = false;
+        this._isAudioMuted = false;
+        this._isResponseStreaming = false;
         this._awaitingNewResponse = false;
         this._currentResponseIsComplete = true;
         this.shouldAnimateResponse = false;
@@ -461,12 +476,26 @@ export class CheatingDaddyApp extends LitElement {
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
-            ipcRenderer.on('new-response', (_, response) => this.addNewResponse(response));
+            ipcRenderer.on('new-response', (_, response) => {
+                this._isResponseStreaming = true;
+                this.addNewResponse(response);
+            });
             ipcRenderer.on('update-response', (_, response) => this.updateCurrentResponse(response));
+            ipcRenderer.on('response-complete', () => {
+                this._isResponseStreaming = false;
+            });
+            ipcRenderer.on('new-transcript', (_, transcript) => {
+                this.transcripts = [...this.transcripts, transcript];
+                this.requestUpdate();
+            });
             ipcRenderer.on('update-status', (_, status) => this.setStatus(status));
             ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
                 this._isClickThrough = isEnabled;
             });
+            ipcRenderer.on('audio-muted-toggled', (_, muted) => {
+                this._isAudioMuted = muted;
+            });
+            ipcRenderer.on('audio-mute-shortcut', () => this.handleToggleAudio());
             ipcRenderer.on('reconnect-failed', (_, data) => this.addNewResponse(data.message));
             ipcRenderer.on('whisper-downloading', (_, downloading) => {
                 this._whisperDownloading = downloading;
@@ -481,8 +510,12 @@ export class CheatingDaddyApp extends LitElement {
             const { ipcRenderer } = window.require('electron');
             ipcRenderer.removeAllListeners('new-response');
             ipcRenderer.removeAllListeners('update-response');
+            ipcRenderer.removeAllListeners('response-complete');
+            ipcRenderer.removeAllListeners('new-transcript');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
+            ipcRenderer.removeAllListeners('audio-muted-toggled');
+            ipcRenderer.removeAllListeners('audio-mute-shortcut');
             ipcRenderer.removeAllListeners('reconnect-failed');
             ipcRenderer.removeAllListeners('whisper-downloading');
         }
@@ -582,6 +615,23 @@ export class CheatingDaddyApp extends LitElement {
         }
     }
 
+    async handleToggleAudio() {
+        if (!this.sessionActive || !window.require) return;
+        const { ipcRenderer } = window.require('electron');
+        // Main process flips the flag and broadcasts 'audio-muted-toggled',
+        // which updates this._isAudioMuted — single source of truth.
+        await ipcRenderer.invoke('toggle-audio-mute');
+    }
+
+    async handleAnswerNow() {
+        if (!this.sessionActive || !window.require) return;
+        const { ipcRenderer } = window.require('electron');
+        const result = await ipcRenderer.invoke('answer-with-context');
+        if (result && !result.success && result.error) {
+            this.setStatus(result.error);
+        }
+    }
+
     // ── Session start ──
 
     async handleStart() {
@@ -639,7 +689,10 @@ export class CheatingDaddyApp extends LitElement {
 
         cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
         this.responses = [];
+        this.transcripts = [];
         this.currentResponseIndex = -1;
+        this._isAudioMuted = false;
+        this._isResponseStreaming = false;
         this.startTime = Date.now();
         this.sessionActive = true;
         this.currentView = 'assistant';
@@ -787,10 +840,12 @@ export class CheatingDaddyApp extends LitElement {
                 return html`
                     <assistant-view
                         .responses=${this.responses}
+                        .transcripts=${this.transcripts}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}
                         .onSendText=${msg => this.handleSendText(msg)}
                         .shouldAnimateResponse=${this.shouldAnimateResponse}
+                        .isStreaming=${this._isResponseStreaming}
                         @response-index-changed=${this.handleResponseIndexChanged}
                         @response-animation-complete=${() => {
                             this.shouldAnimateResponse = false;
@@ -950,6 +1005,18 @@ export class CheatingDaddyApp extends LitElement {
                     ${this.statusText ? html`<span class="live-bar-text">${this.statusText}</span>` : ''}
                     <span class="live-bar-text">${this.getElapsedTime()}</span>
                     ${this._isClickThrough ? html`<span class="live-bar-text">[click through]</span>` : ''}
+                    <span
+                        class="live-bar-text clickable ${this._isAudioMuted ? 'muted' : ''}"
+                        title=${`${cheatingDaddy.isMacOS ? 'Cmd' : 'Ctrl'}+Shift+M — ${this._isAudioMuted ? 'resume listening' : 'pause listening'}`}
+                        @click=${() => this.handleToggleAudio()}
+                        >${this._isAudioMuted ? '[muted]' : '[mute]'}</span
+                    >
+                    <span
+                        class="live-bar-text clickable"
+                        title=${`${cheatingDaddy.isMacOS ? 'Cmd' : 'Ctrl'}+Shift+G — answer the last heard question now`}
+                        @click=${() => this.handleAnswerNow()}
+                        >[answer now]</span
+                    >
                     <span class="live-bar-text clickable" @click=${() => this.handleHideToggle()}>[hide]</span>
                 </div>
             </div>
