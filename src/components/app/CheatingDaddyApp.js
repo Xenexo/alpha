@@ -381,6 +381,7 @@ export class CheatingDaddyApp extends LitElement {
         selectedLanguage: { type: String },
         responses: { type: Array },
         transcripts: { type: Array },
+        interimTranscript: { type: String },
         currentResponseIndex: { type: Number },
         selectedScreenshotInterval: { type: String },
         selectedImageQuality: { type: String },
@@ -410,6 +411,8 @@ export class CheatingDaddyApp extends LitElement {
         this.layoutMode = 'normal';
         this.responses = [];
         this.transcripts = [];
+        this.interimTranscript = '';
+        this._interimClearTimer = null;
         this.currentResponseIndex = -1;
         this._viewInstances = new Map();
         this._isClickThrough = false;
@@ -486,6 +489,17 @@ export class CheatingDaddyApp extends LitElement {
             });
             ipcRenderer.on('new-transcript', (_, transcript) => {
                 this.transcripts = [...this.transcripts, transcript];
+                this._clearInterim();
+                this.requestUpdate();
+            });
+            // Live partial transcript while the user is still speaking. Replaced
+            // by the finalized entry when 'new-transcript' lands; cleared on a
+            // safety timeout in case the utterance was filtered as filler and no
+            // final transcript ever arrives.
+            ipcRenderer.on('interim-transcript', (_, transcript) => {
+                this.interimTranscript = transcript || '';
+                if (this._interimClearTimer) clearTimeout(this._interimClearTimer);
+                this._interimClearTimer = setTimeout(() => this._clearInterim(), 5000);
                 this.requestUpdate();
             });
             ipcRenderer.on('update-status', (_, status) => this.setStatus(status));
@@ -512,6 +526,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('update-response');
             ipcRenderer.removeAllListeners('response-complete');
             ipcRenderer.removeAllListeners('new-transcript');
+            ipcRenderer.removeAllListeners('interim-transcript');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
             ipcRenderer.removeAllListeners('audio-muted-toggled');
@@ -554,6 +569,17 @@ export class CheatingDaddyApp extends LitElement {
         this.statusText = text;
         if (text.includes('Ready') || text.includes('Listening') || text.includes('Error')) {
             this._currentResponseIsComplete = true;
+        }
+    }
+
+    _clearInterim() {
+        if (this._interimClearTimer) {
+            clearTimeout(this._interimClearTimer);
+            this._interimClearTimer = null;
+        }
+        if (this.interimTranscript) {
+            this.interimTranscript = '';
+            this.requestUpdate();
         }
     }
 
@@ -690,6 +716,7 @@ export class CheatingDaddyApp extends LitElement {
         cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
         this.responses = [];
         this.transcripts = [];
+        this._clearInterim();
         this.currentResponseIndex = -1;
         this._isAudioMuted = false;
         this._isResponseStreaming = false;
@@ -841,6 +868,7 @@ export class CheatingDaddyApp extends LitElement {
                     <assistant-view
                         .responses=${this.responses}
                         .transcripts=${this.transcripts}
+                        .interimTranscript=${this.interimTranscript}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}
                         .onSendText=${msg => this.handleSendText(msg)}

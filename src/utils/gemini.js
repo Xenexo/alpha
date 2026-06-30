@@ -66,10 +66,24 @@ const RECONNECT_DELAY = 2000;
 // Timer used to fire the text-API call shortly after turnComplete
 let turnCompleteTimer = null;
 
-function sendToRenderer(channel, data) {
+// Resolve the main UI window. BrowserWindow.getAllWindows() order is NOT
+// guaranteed to be creation order, so [0] is unreliable once the hidden Whisper
+// worker window (whisper-worker.html, no UI) also exists — UI events would
+// silently land there and the visible window would never update. Exclude the
+// worker explicitly and target the real window.
+function getMainWindow() {
     const windows = BrowserWindow.getAllWindows();
-    if (windows.length > 0) {
-        windows[0].webContents.send(channel, data);
+    return (
+        windows.find(w => !w.isDestroyed() && !w.webContents.getURL().includes('whisper-worker')) ||
+        windows[0] ||
+        null
+    );
+}
+
+function sendToRenderer(channel, data) {
+    const win = getMainWindow();
+    if (win && !win.isDestroyed()) {
+        win.webContents.send(channel, data);
     }
 }
 
@@ -204,13 +218,13 @@ async function getEnabledTools() {
 
 async function getStoredSetting(key, defaultValue) {
     try {
-        const windows = BrowserWindow.getAllWindows();
-        if (windows.length > 0) {
+        const win = getMainWindow();
+        if (win && !win.isDestroyed()) {
             // Wait a bit for the renderer to be ready
             await new Promise(resolve => setTimeout(resolve, 100));
 
             // Try to get setting from renderer process localStorage
-            const value = await windows[0].webContents.executeJavaScript(`
+            const value = await win.webContents.executeJavaScript(`
                 (function() {
                     try {
                         if (typeof localStorage === 'undefined') {
@@ -1309,6 +1323,7 @@ module.exports = {
     getEnabledTools,
     getStoredSetting,
     sendToRenderer,
+    getMainWindow,
     initializeNewSession,
     saveConversationTurn,
     saveScreenAnalysis,

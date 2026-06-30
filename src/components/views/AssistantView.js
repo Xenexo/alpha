@@ -44,6 +44,16 @@ export class AssistantView extends LitElement {
             color: var(--text-primary);
         }
 
+        /* Live partial transcript — distinct from finalized "Heard" entries. */
+        .transcript-item.interim {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .transcript-item.interim::after {
+            content: '…';
+        }
+
         .transcript-panel::-webkit-scrollbar {
             width: 6px;
         }
@@ -421,6 +431,7 @@ export class AssistantView extends LitElement {
     static properties = {
         responses: { type: Array },
         transcripts: { type: Array },
+        interimTranscript: { type: String },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
@@ -434,6 +445,7 @@ export class AssistantView extends LitElement {
         super();
         this.responses = [];
         this.transcripts = [];
+        this.interimTranscript = '';
         this.currentResponseIndex = -1;
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
@@ -748,7 +760,7 @@ export class AssistantView extends LitElement {
             this.updateResponseContent();
         }
 
-        if (changedProperties.has('transcripts')) {
+        if (changedProperties.has('transcripts') || changedProperties.has('interimTranscript')) {
             const panel = this.shadowRoot.querySelector('#transcriptPanel');
             if (panel) panel.scrollTop = panel.scrollHeight;
         }
@@ -797,12 +809,15 @@ export class AssistantView extends LitElement {
         const hasMultipleResponses = this.responses.length > 1;
 
         return html`
-            ${this.transcripts && this.transcripts.length > 0 ? html`
+            ${(this.transcripts && this.transcripts.length > 0) || this.interimTranscript ? html`
                 <div class="transcript-panel" id="transcriptPanel">
                     <div class="transcript-label">Heard</div>
                     ${this.transcripts.map((t, i) => html`
-                        <div class="transcript-item ${i === this.transcripts.length - 1 ? 'latest' : ''}">${t}</div>
+                        <div class="transcript-item ${i === this.transcripts.length - 1 && !this.interimTranscript ? 'latest' : ''}">${t}</div>
                     `)}
+                    ${this.interimTranscript ? html`
+                        <div class="transcript-item interim">${this.interimTranscript}</div>
+                    ` : ''}
                 </div>
             ` : ''}
 

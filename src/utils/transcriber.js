@@ -1,10 +1,12 @@
 // Shared speech-to-text pipeline (24kHz PCM → resample → VAD → Whisper).
 // Used by the Local AI and Claude providers; only one provider is active at a time.
 const { sendToRenderer } = require('./gemini');
+const whisperWindow = require('./whisperWindow');
 
 // ── State ──
 
-let whisperPipeline = null;
+let whisperPipeline = null; // CPU-backend pipeline (only set when backend==='cpu')
+let backend = null; // 'webgpu' | 'cpu' — null until a model is loaded
 let isWhisperLoading = false;
 let onTranscript = null;
 let isTranscribing = false;
@@ -23,6 +25,13 @@ let speechFrameCount = 0;
 const PRE_SPEECH_FRAMES = 8;
 let preSpeechBuffer = [];
 
+// Streaming partial transcription. While the user is still speaking, transcribe
+// the audio accumulated so far every ~1.5s and emit it as an interim result so
+// the UI can show the words live instead of waiting for the end-of-utterance
+// silence plus a whole-utterance inference pass. Each frame is ~0.1s.
+const INTERIM_INTERVAL_FRAMES = 15;
+let lastInterimFrameCount = 0;
+
 // VAD configuration
 const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
@@ -33,7 +42,7 @@ const VAD_MODES = {
     // sentence accumulate before transcription instead of being chopped into
     // short fragments — Whisper (especially the tiny model) is far more
     // accurate with complete-utterance context.
-    BALANCED: { energyThreshold: 0.01, speechFramesRequired: 2, silenceFramesRequired: 10 },
+    BALANCED: { energyThreshold: 0.01, speechFramesRequired: 2, silenceFramesRequired: 3 },
 };
 let vadConfig = VAD_MODES.BALANCED;
 
@@ -96,6 +105,8 @@ function processVAD(pcm16kBuffer) {
             // preSpeechBuffer already contains recent silence + the confirmation frames
             speechBuffers = preSpeechBuffer.map(b => Buffer.from(b));
             preSpeechBuffer = [];
+            // Don't fire the first interim until a full interval of new speech.
+            lastInterimFrameCount = speechBuffers.length;
             console.log('[Transcriber] Speech started (RMS:', rms.toFixed(4), ', pre-speech frames:', speechBuffers.length, ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
@@ -137,6 +148,44 @@ function processVAD(pcm16kBuffer) {
     // Accumulate audio during speech
     if (isSpeaking) {
         speechBuffers.push(Buffer.from(pcm16kBuffer));
+
+        // Emit a live partial transcript roughly every INTERIM_INTERVAL_FRAMES.
+        // runInterim self-throttles if the pipeline is still busy, so advancing
+        // the counter here (even when an interim is skipped) just means the next
+        // attempt happens one interval later — never a backlog of interim jobs.
+        if (speechBuffers.length - lastInterimFrameCount >= INTERIM_INTERVAL_FRAMES) {
+            lastInterimFrameCount = speechBuffers.length;
+            runInterim();
+        }
+    }
+}
+
+// Transcribe the speech buffered so far and emit it as an interim result.
+// Fire-and-forget: shares the single `isTranscribing` pipeline lock with final
+// transcription so the two never run overlapping inference, and skips entirely
+// when the pipeline is busy (interim results are disposable). A final segment
+// queued while this runs is drained in the finally, exactly as queueTranscription does.
+async function runInterim() {
+    if (isTranscribing || !isSpeaking || speechBuffers.length === 0) return;
+
+    isTranscribing = true;
+    const generation = transcriptionGeneration;
+    const snapshot = Buffer.concat(speechBuffers);
+
+    try {
+        const text = await transcribeAudio(snapshot);
+        // Drop if the session reset, speech already ended (the final pass will
+        // supersede it), or there's nothing usable.
+        if (generation === transcriptionGeneration && isSpeaking && text && text.trim().length >= 2) {
+            sendToRenderer('interim-transcript', text.trim());
+        }
+    } finally {
+        isTranscribing = false;
+        const queued = pendingAudioJob;
+        pendingAudioJob = null;
+        if (queued && queued.generation === transcriptionGeneration) {
+            queueTranscription(queued.audioData);
+        }
     }
 }
 
@@ -159,14 +208,39 @@ function getDtypeForModel(modelName) {
     return 'q8';
 }
 
+// Sentinel returned to callers that only check truthiness for "loaded".
+// On WebGPU the pipeline lives in the hidden window, so there is no in-process
+// object to return — `true` signals success without exposing the remote handle.
+function loadedHandle() {
+    return backend === 'cpu' ? whisperPipeline : backend === 'webgpu' ? true : null;
+}
+
 async function loadWhisperPipeline(modelName) {
-    if (whisperPipeline) return whisperPipeline;
+    if (backend) return loadedHandle();
     if (isWhisperLoading) return null;
 
     isWhisperLoading = true;
     console.log('[Transcriber] Loading Whisper model:', modelName);
     sendToRenderer('whisper-downloading', true);
     sendToRenderer('update-status', 'Loading Whisper model (first time may take a while)...');
+
+    // Prefer WebGPU (runs inference on the Apple GPU in a hidden window) so the
+    // heavy model does not saturate the CPU in the main process. Fall back to
+    // the in-process CPU pipeline if WebGPU is unavailable or fails to load.
+    try {
+        if (await whisperWindow.isWebGPUAvailable()) {
+            console.log('[Transcriber] Loading Whisper on WebGPU:', modelName);
+            await whisperWindow.loadModel(modelName);
+            backend = 'webgpu';
+            console.log('[Transcriber] Whisper model loaded on WebGPU');
+            sendToRenderer('whisper-downloading', false);
+            isWhisperLoading = false;
+            return loadedHandle();
+        }
+        console.warn('[Transcriber] WebGPU unavailable — falling back to CPU');
+    } catch (error) {
+        console.error('[Transcriber] WebGPU load failed — falling back to CPU:', error);
+    }
 
     try {
         // Dynamic import for ESM module
@@ -193,6 +267,7 @@ async function loadWhisperPipeline(modelName) {
             console.warn('[Transcriber] Warmup inference failed (non-fatal):', warmupError.message);
         }
 
+        backend = 'cpu';
         sendToRenderer('whisper-downloading', false);
         isWhisperLoading = false;
         return whisperPipeline;
@@ -205,6 +280,48 @@ async function loadWhisperPipeline(modelName) {
     }
 }
 
+// Whisper's decoder sometimes falls into a repetition loop and emits the same
+// word or phrase over and over ("this is this is this is…"), especially on
+// short, partial, or silence-padded audio. `no_repeat_ngram_size` in the
+// generation config prevents most of it; this collapses any consecutive
+// repeats that still slip through. Works from the longest repeated phrase down
+// to single words so "this is this is" collapses to "this is" before a stray
+// single-word pass could mangle it.
+function collapseRepetitions(text) {
+    if (!text) return text;
+    let words = text.trim().split(/\s+/);
+    for (let n = 6; n >= 1; n--) {
+        const out = [];
+        let i = 0;
+        while (i < words.length) {
+            const gram = words.slice(i, i + n);
+            if (gram.length < n) {
+                out.push(words[i]);
+                i++;
+                continue;
+            }
+            const key = gram.join(' ').toLowerCase();
+            let reps = 1;
+            let j = i + n;
+            while (j + n <= words.length && words.slice(j, j + n).join(' ').toLowerCase() === key) {
+                reps++;
+                j += n;
+            }
+            // A single word must repeat 3+ times to count as a loop (genuine
+            // doubles like "very very" are fine); phrases collapse at 2+.
+            if (reps >= (n === 1 ? 3 : 2)) {
+                out.push(...gram);
+                i = j;
+            } else {
+                out.push(words[i]);
+                i++;
+            }
+        }
+        words = out;
+    }
+    return words.join(' ');
+}
+
 function pcm16ToFloat32(pcm16Buffer) {
     const samples = pcm16Buffer.length / 2;
     const float32 = new Float32Array(samples);
@@ -215,7 +332,7 @@ function pcm16ToFloat32(pcm16Buffer) {
 }
 
 async function transcribeAudio(pcm16kBuffer) {
-    if (!whisperPipeline) {
+    if (!backend) {
         console.error('[Transcriber] Whisper pipeline not loaded');
         return null;
     }
@@ -224,15 +341,25 @@ async function transcribeAudio(pcm16kBuffer) {
         const startedAt = Date.now();
         const float32Audio = pcm16ToFloat32(pcm16kBuffer);
 
-        // Whisper expects audio at 16kHz which is what we have
-        const result = await whisperPipeline(float32Audio, {
-            sampling_rate: 16000,
-            language: 'en',
-            task: 'transcribe',
-        });
+        let text;
+        if (backend === 'webgpu') {
+            // Inference runs on the Apple GPU in the hidden Whisper window.
+            text = await whisperWindow.transcribe(float32Audio, 16000);
+        } else {
+            // Whisper expects audio at 16kHz which is what we have
+            const result = await whisperPipeline(float32Audio, {
+                sampling_rate: 16000,
+                language: 'en',
+                task: 'transcribe',
+                // Block the decoder from repeating any 3-gram — the primary guard
+                // against "this is this is this is…" loops.
+                no_repeat_ngram_size: 3,
+            });
+            text = result.text?.trim();
+        }
 
-        const text = result.text?.trim();
-        console.log(`[Transcriber] Completed in ${Date.now() - startedAt}ms:`, text);
+        text = collapseRepetitions(text);
+        console.log(`[Transcriber] Completed in ${Date.now() - startedAt}ms (${backend}):`, text);
         return text;
     } catch (error) {
         console.error('[Transcriber] Transcription error:', error);
@@ -331,6 +458,7 @@ function flush() {
     isSpeaking = false;
     silenceFrameCount = 0;
     speechFrameCount = 0;
+    lastInterimFrameCount = 0;
     queueTranscription(audioData);
     return true;
 }
@@ -342,6 +470,7 @@ function resetTranscriber() {
     preSpeechBuffer = [];
     silenceFrameCount = 0;
     speechFrameCount = 0;
+    lastInterimFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
     pendingAudioJob = null;
     onTranscript = null;

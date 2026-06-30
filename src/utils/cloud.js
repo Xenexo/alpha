@@ -10,9 +10,13 @@ let audioChunkCount = 0;
 let onTurnComplete = null;
 
 function sendToRenderer(channel, data) {
+    // Exclude the hidden Whisper worker window (whisper-worker.html) — it has no
+    // UI and getAllWindows() order is not guaranteed, so [0] is unreliable.
     const windows = BrowserWindow.getAllWindows();
-    if (windows.length > 0) {
-        windows[0].webContents.send(channel, data);
+    const win =
+        windows.find(w => !w.isDestroyed() && !w.webContents.getURL().includes('whisper-worker')) || windows[0];
+    if (win && !win.isDestroyed()) {
+        win.webContents.send(channel, data);
     }
 }
 

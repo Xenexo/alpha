@@ -412,7 +412,9 @@ function runClaudeCli(prompt, { allowedTools } = {}) {
 // ── Claude Code SDK (SSE, no subprocess) ──
 // Uses the same auth as `claude login`. Eliminates per-request spawn overhead.
 
-async function runClaudeQuery(prompt) {
+// quiet: suppress all renderer/status events. Used by the init warm-up so it
+// primes the agent runtime without flickering the UI or showing a response.
+async function runClaudeQuery(prompt, { quiet = false } = {}) {
     const requestStartedAt = Date.now();
     let firstTokenLogged = false;
     let query;
@@ -434,6 +436,7 @@ async function runClaudeQuery(prompt) {
     let lastResponseUpdateAt = 0;
 
     const emitResponse = (force = false) => {
+        if (quiet) return;
         if (!fullText) return;
         const elapsed = Date.now() - lastResponseUpdateAt;
 
@@ -514,7 +517,7 @@ async function runClaudeQuery(prompt) {
                 if (msg.session_id) cliSessionId = msg.session_id;
                 if (msg.is_error || (msg.subtype && msg.subtype !== 'success')) {
                     const errMsg = msg.result || 'Claude error';
-                    sendToRenderer('update-status', 'Claude error: ' + errMsg);
+                    if (!quiet) sendToRenderer('update-status', 'Claude error: ' + errMsg);
                     return { success: false, error: errMsg };
                 }
                 const final = msg.result || fullText;
@@ -531,7 +534,7 @@ async function runClaudeQuery(prompt) {
         if (/login|auth|unauthorized|401|credentials/i.test(err.message)) {
             message = 'Claude not logged in — run "claude" in a terminal and sign in';
         }
-        sendToRenderer('update-status', message);
+        if (!quiet) sendToRenderer('update-status', message);
         return { success: false, error: message };
     } finally {
         if (responseUpdateTimer) clearTimeout(responseUpdateTimer);
@@ -540,8 +543,30 @@ async function runClaudeQuery(prompt) {
 
     if (!fullText) return { success: false, error: 'Claude returned no response' };
     console.log(`[Claude] Response completed in ${Date.now() - requestStartedAt}ms`);
-    sendToRenderer('update-status', 'Listening...');
+    if (!quiet) sendToRenderer('update-status', 'Listening...');
     return { success: true, text: fullText };
+}
+
+// Pay the agent runtime's cold-start cost (module/agent init, auth handshake,
+// first-token warmup) during session setup instead of on the candidate's first
+// real question mid-interview. The throwaway session is discarded so the dummy
+// exchange never leaks into the real conversation, and a slow run here surfaces
+// the SDK→subprocess fallback in the logs before it can hurt a live answer.
+async function warmUpClaude() {
+    if (claudeMode !== 'cli') return;
+    const startedAt = Date.now();
+    try {
+        const result = await runClaudeQuery('Reply with the single word: ready', { quiet: true });
+        if (result.success) {
+            console.log(`[Claude] Warm-up completed in ${Date.now() - startedAt}ms`);
+        } else {
+            console.warn('[Claude] Warm-up did not succeed (non-fatal):', result.error);
+        }
+    } catch (error) {
+        console.warn('[Claude] Warm-up failed (non-fatal):', error.message);
+    } finally {
+        cliSessionId = null; // start the real conversation fresh, no warm-up turn
+    }
 }
 
 // ── Anthropic API streaming ──
@@ -598,6 +623,11 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
         claudeModel = model || 'claude-haiku-4-5-20251001';
 
+        // Started during CLI setup and awaited just before the session goes
+        // active, so the agent cold-start overlaps the Whisper model load
+        // (the long pole) instead of adding to init wall-clock.
+        let warmUpPromise = null;
+
         if (claudeMode === 'cli') {
             const cli = await resolveClaudeCli();
             if (!cli) {
@@ -614,6 +644,8 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
             await getQueryFn().catch(error => {
                 console.warn('[Claude] SDK preload failed; CLI fallback will be used:', error.message);
             });
+
+            warmUpPromise = warmUpClaude();
         } else {
             if (!anthropicApiKey || !anthropicApiKey.trim()) {
                 sendToRenderer('session-initializing', false);
@@ -636,6 +668,10 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         });
 
         initializeNewSession(profile, customPrompt);
+
+        // Finish the cold-start warm-up before accepting audio so it can never
+        // race a real question (which would clobber the in-flight query/session).
+        if (warmUpPromise) await warmUpPromise;
 
         isClaudeActive = true;
         isAudioMuted = false;
