@@ -2,11 +2,12 @@
 // Used by the Local AI and Claude providers; only one provider is active at a time.
 const { sendToRenderer } = require('./gemini');
 const whisperWindow = require('./whisperWindow');
+const whisperkitSidecar = require('./whisperkitSidecar');
 
 // ── State ──
 
 let whisperPipeline = null; // CPU-backend pipeline (only set when backend==='cpu')
-let backend = null; // 'webgpu' | 'cpu' — null until a model is loaded
+let backend = null; // 'ane' | 'webgpu' | 'cpu' — null until a model is loaded
 let isWhisperLoading = false;
 let onTranscript = null;
 let isTranscribing = false;
@@ -41,8 +42,10 @@ const VAD_MODES = {
     // Each VAD frame is ~0.1s. A ~1.0s end-of-utterance silence lets a full
     // sentence accumulate before transcription instead of being chopped into
     // short fragments — Whisper (especially the tiny model) is far more
-    // accurate with complete-utterance context.
-    BALANCED: { energyThreshold: 0.01, speechFramesRequired: 2, silenceFramesRequired: 3 },
+    // accurate with complete-utterance context. Interviewers routinely pause
+    // 0.5-1.0s mid-sentence, so 15 frames keeps partial phrases out of the
+    // transcript queue without adding perceptible latency to genuine turn-ends.
+    BALANCED: { energyThreshold: 0.007, speechFramesRequired: 2, silenceFramesRequired: 5 },
 };
 let vadConfig = VAD_MODES.BALANCED;
 
@@ -209,10 +212,11 @@ function getDtypeForModel(modelName) {
 }
 
 // Sentinel returned to callers that only check truthiness for "loaded".
-// On WebGPU the pipeline lives in the hidden window, so there is no in-process
-// object to return — `true` signals success without exposing the remote handle.
+// On ANE/WebGPU the pipeline lives outside this process (sidecar / hidden
+// window), so there is no in-process object to return — `true` signals
+// success without exposing the remote handle.
 function loadedHandle() {
-    return backend === 'cpu' ? whisperPipeline : backend === 'webgpu' ? true : null;
+    return backend === 'cpu' ? whisperPipeline : backend ? true : null;
 }
 
 async function loadWhisperPipeline(modelName) {
@@ -224,9 +228,24 @@ async function loadWhisperPipeline(modelName) {
     sendToRenderer('whisper-downloading', true);
     sendToRenderer('update-status', 'Loading Whisper model (first time may take a while)...');
 
-    // Prefer WebGPU (runs inference on the Apple GPU in a hidden window) so the
-    // heavy model does not saturate the CPU in the main process. Fall back to
-    // the in-process CPU pipeline if WebGPU is unavailable or fails to load.
+    // Backend preference: ANE (WhisperKit sidecar, Apple Silicon + brew-installed
+    // CLI only) > WebGPU (hidden window on the Apple GPU) > in-process CPU.
+    // Each tier falls through to the next on unavailability or load failure.
+    try {
+        if (whisperkitSidecar.isAvailable()) {
+            console.log('[Transcriber] Loading Whisper on the Neural Engine (WhisperKit):', modelName);
+            await whisperkitSidecar.loadModel(modelName);
+            backend = 'ane';
+            console.log('[Transcriber] Whisper model loaded on the Neural Engine');
+            sendToRenderer('whisper-downloading', false);
+            isWhisperLoading = false;
+            return loadedHandle();
+        }
+        console.log('[Transcriber] WhisperKit sidecar unavailable — trying WebGPU');
+    } catch (error) {
+        console.error('[Transcriber] WhisperKit load failed — falling back to WebGPU:', error);
+    }
+
     try {
         if (await whisperWindow.isWebGPUAvailable()) {
             console.log('[Transcriber] Loading Whisper on WebGPU:', modelName);
@@ -303,7 +322,13 @@ function collapseRepetitions(text) {
             const key = gram.join(' ').toLowerCase();
             let reps = 1;
             let j = i + n;
-            while (j + n <= words.length && words.slice(j, j + n).join(' ').toLowerCase() === key) {
+            while (
+                j + n <= words.length &&
+                words
+                    .slice(j, j + n)
+                    .join(' ')
+                    .toLowerCase() === key
+            ) {
                 reps++;
                 j += n;
             }
@@ -342,7 +367,10 @@ async function transcribeAudio(pcm16kBuffer) {
         const float32Audio = pcm16ToFloat32(pcm16kBuffer);
 
         let text;
-        if (backend === 'webgpu') {
+        if (backend === 'ane') {
+            // Inference runs on the Apple Neural Engine in the WhisperKit sidecar.
+            text = await whisperkitSidecar.transcribe(float32Audio, 16000);
+        } else if (backend === 'webgpu') {
             // Inference runs on the Apple GPU in the hidden Whisper window.
             text = await whisperWindow.transcribe(float32Audio, 16000);
         } else {
@@ -463,6 +491,13 @@ function flush() {
     return true;
 }
 
+// True while more transcript text is imminent: the VAD still hears speech, or
+// an utterance is being (or waiting to be) transcribed. Lets the consumer hold
+// off sending a "complete" question to the AI while the speaker is mid-turn.
+function isPipelineBusy() {
+    return isSpeaking || isTranscribing || pendingAudioJob !== null;
+}
+
 function resetTranscriber() {
     transcriptionGeneration++;
     isSpeaking = false;
@@ -482,5 +517,6 @@ module.exports = {
     setOnTranscript,
     processAudio24k,
     flush,
+    isPipelineBusy,
     resetTranscriber,
 };

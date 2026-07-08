@@ -554,6 +554,7 @@ export class MainView extends LitElement {
         this._claudeModels = null;
         this._claudeModelsLoading = false;
         this._modelFetchTimer = null;
+        this._whisperBackendInfo = null; // { appleSilicon, whisperkitInstalled }
 
         this._animId = null;
         this._time = 0;
@@ -593,6 +594,9 @@ export class MainView extends LitElement {
             this._claudeMode = prefs.claudeMode || 'cli';
             this._claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
             this._anthropicKey = creds.anthropicApiKey || '';
+
+            const { ipcRenderer } = window.require('electron');
+            this._whisperBackendInfo = await ipcRenderer.invoke('whisper-backend-info').catch(() => null);
 
             this.requestUpdate();
         } catch (e) {
@@ -1025,8 +1029,24 @@ export class MainView extends LitElement {
                 <div class="form-hint">
                     ${this.whisperDownloading ? 'Downloading model...' : 'Used for speech-to-text, downloaded automatically on first use'}
                 </div>
+                ${this._renderAneHint()}
             </div>
         `;
+    }
+
+    // Neural Engine status line under the Whisper model select. The backend
+    // auto-selects at session start; this just tells the user whether the
+    // WhisperKit sidecar will be used, or how to enable it on Apple Silicon.
+    _renderAneHint() {
+        const info = this._whisperBackendInfo;
+        if (!info || !info.appleSilicon) return '';
+        if (info.whisperkitInstalled) {
+            return html`<div class="form-hint">Apple Neural Engine: active (WhisperKit)</div>`;
+        }
+        return html`<div class="form-hint">
+            Faster transcription available — install WhisperKit for Neural Engine acceleration:
+            <code>brew install whisperkit-cli</code>
+        </div>`;
     }
 
     // ── Claude mode ──

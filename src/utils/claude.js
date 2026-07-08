@@ -23,6 +23,14 @@ let isAudioMuted = false;
 let isTranscriptResponseInFlight = false;
 let pendingTranscripts = [];
 let transcriptDebounceTimer = null;
+// Supersede state: when the interviewer keeps talking after an auto-answer has
+// already been fired (feedback → pause → real question), the stale in-flight
+// request is aborted and re-sent combined with the new speech, instead of
+// making the real question wait behind a useless answer.
+let lastSentTranscriptTurn = null; // text of the in-flight auto request, for recombination
+let inFlightIsSupersedable = false; // only flushPendingTranscripts-initiated requests
+let pendingFirstQueuedAt = 0; // when the oldest pending fragment arrived
+const MAX_FLUSH_HOLD_MS = 3000;
 // Rolling window of everything recently heard — including fragments suppressed
 // by isMeaningfulTranscript — so the user can manually ask Claude to answer
 // speech that was heard but not auto-answered (see answerWithContext).
@@ -40,7 +48,7 @@ const RESPONSE_UPDATE_INTERVAL_MS = 50;
 let cliPath = null;
 let cliEnv = null;
 let cliSessionId = null; // session_id from SDK / --resume, keeps conversation context
-let activeCliProc = null;  // subprocess handle (image path only)
+let activeCliProc = null; // subprocess handle (image path only)
 let activeCliAbort = null; // AbortController for in-flight SDK query (text path)
 
 // Lazy-loaded @anthropic-ai/claude-code query function
@@ -105,6 +113,15 @@ async function flushPendingTranscripts() {
     transcriptDebounceTimer = null;
     if (!isClaudeActive || isTranscriptResponseInFlight || pendingTranscripts.length === 0) return;
 
+    // The speaker is still mid-turn (VAD hears speech, or an utterance is being
+    // transcribed) — more text is imminent, so hold the flush and let it merge
+    // instead of answering half a question. Bounded so a noisy VAD can't
+    // starve answers forever.
+    if (transcriber.isPipelineBusy() && Date.now() - pendingFirstQueuedAt < MAX_FLUSH_HOLD_MS) {
+        transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+        return;
+    }
+
     const transcription = pendingTranscripts.join(' ').trim();
     pendingTranscripts = [];
     if (!transcription) return;
@@ -112,6 +129,8 @@ async function flushPendingTranscripts() {
     if (!isMeaningfulTranscript(transcription)) return;
 
     isTranscriptResponseInFlight = true;
+    lastSentTranscriptTurn = transcription;
+    inFlightIsSupersedable = true;
     // Surface what was heard so the live view can show which question each
     // answer is responding to.
     sendToRenderer('new-transcript', transcription);
@@ -124,6 +143,8 @@ async function flushPendingTranscripts() {
         recentHeardTranscripts = [];
     } finally {
         isTranscriptResponseInFlight = false;
+        inFlightIsSupersedable = false;
+        lastSentTranscriptTurn = null;
         if (isClaudeActive && pendingTranscripts.length > 0) {
             transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
         }
@@ -144,14 +165,35 @@ function queueTranscript(transcription) {
     // Drop hallucinated/filler fragments so they neither show as a "question"
     // nor trigger a response. Real fragments still merge via the debounce.
     if (!isMeaningfulTranscript(transcription)) {
-        if (heard) sendToRenderer('update-status', `Heard: "${heard.length > 40 ? heard.slice(0, 40) + '…' : heard}" — say more or use Answer With Context (${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G)`);
+        if (heard)
+            sendToRenderer(
+                'update-status',
+                `Heard: "${heard.length > 40 ? heard.slice(0, 40) + '…' : heard}" — say more or use Answer With Context (${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G)`
+            );
         return;
     }
     pendingTranscripts.push(transcription);
+    if (pendingTranscripts.length === 1) pendingFirstQueuedAt = Date.now();
 
-    // Merge phrases separated by short VAD pauses. If Claude is already
-    // responding, flush once it finishes instead of starting concurrently.
-    if (isTranscriptResponseInFlight) return;
+    // Merge phrases separated by short VAD pauses. If an auto-answer is already
+    // in flight, it's now stale (the speaker kept going — e.g. feedback followed
+    // by the real question): abort it and let the finally-re-flush resend the
+    // already-sent text combined with the new speech as one prompt. Manual
+    // answers (answerWithContext) are never aborted.
+    if (isTranscriptResponseInFlight) {
+        if (inFlightIsSupersedable) {
+            if (lastSentTranscriptTurn) {
+                pendingTranscripts.unshift(lastSentTranscriptTurn);
+                lastSentTranscriptTurn = null; // no double-prepend on rapid supersedes
+            }
+            if (activeCliAbort) activeCliAbort.abort();
+            // Let the UI replace the now-stale partial answer/transcript with
+            // the combined resend instead of stacking a junk card per supersede.
+            sendToRenderer('response-superseded');
+            sendToRenderer('update-status', 'Heard more — updating answer...');
+        }
+        return; // the in-flight finally re-flushes after the debounce
+    }
     if (transcriptDebounceTimer) clearTimeout(transcriptDebounceTimer);
     transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
 }
@@ -170,12 +212,13 @@ async function answerWithContext() {
 
     // Prefer anything pending; otherwise fall back to the recently heard
     // window (which includes fragments suppressed by the noise filter).
-    const heard = [...pendingTranscripts, ...recentHeardTranscripts]
-        .map(t => t.trim())
-        .filter(Boolean);
+    const heard = [...pendingTranscripts, ...recentHeardTranscripts].map(t => t.trim()).filter(Boolean);
     pendingTranscripts = [];
     // De-duplicate consecutive repeats while preserving order.
-    const speech = heard.filter((t, i) => t !== heard[i - 1]).join(' ').trim();
+    const speech = heard
+        .filter((t, i) => t !== heard[i - 1])
+        .join(' ')
+        .trim();
 
     if (!speech) {
         sendToRenderer('update-status', 'Nothing heard yet to answer');
@@ -183,6 +226,8 @@ async function answerWithContext() {
     }
 
     isTranscriptResponseInFlight = true;
+    // An explicitly requested answer must never be aborted by new speech.
+    inFlightIsSupersedable = false;
     sendToRenderer('new-transcript', speech);
     sendToRenderer('update-status', 'Answering with context...');
 
@@ -217,12 +262,7 @@ function buildAugmentedEnv() {
     // Electron GUI apps on macOS inherit a minimal PATH that misses the
     // common CLI install locations, so add them explicitly.
     const home = os.homedir();
-    const extraPaths = [
-        '/usr/local/bin',
-        '/opt/homebrew/bin',
-        path.join(home, '.claude', 'local'),
-        path.join(home, '.local', 'bin'),
-    ];
+    const extraPaths = ['/usr/local/bin', '/opt/homebrew/bin', path.join(home, '.claude', 'local'), path.join(home, '.local', 'bin')];
     const sep = process.platform === 'win32' ? ';' : ':';
     return {
         ...process.env,
@@ -282,7 +322,11 @@ function runClaudeCli(prompt, { allowedTools } = {}) {
 
         let proc;
         try {
-            proc = spawn(cliPath, args, { env: cliEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+            // Same cwd as the SDK path (runClaudeQuery). Claude Code stores
+            // conversations per project directory (keyed by cwd), so resuming
+            // a session created by the SDK from a different cwd fails with
+            // "No conversation found with session ID".
+            proc = spawn(cliPath, args, { env: cliEnv, stdio: ['ignore', 'pipe', 'pipe'], cwd: os.tmpdir() });
         } catch (error) {
             resolve({ success: false, error: 'Failed to start Claude CLI: ' + error.message });
             return;
@@ -541,6 +585,9 @@ async function runClaudeQuery(prompt, { quiet = false } = {}) {
         if (activeCliAbort === controller) activeCliAbort = null;
     }
 
+    // An abort can land between stream messages and exit the loop via `break`
+    // with partial text — don't let that be saved/rendered as a success.
+    if (controller.signal.aborted) return { success: false, error: 'Cancelled' };
     if (!fullText) return { success: false, error: 'Claude returned no response' };
     console.log(`[Claude] Response completed in ${Date.now() - requestStartedAt}ms`);
     if (!quiet) sendToRenderer('update-status', 'Listening...');
@@ -729,6 +776,19 @@ function setPushToTalk(active) {
     return true;
 }
 
+// The CLI's per-project conversation store can lose a session we still hold
+// an id for (transcript cleanup, store moved). When resume fails that way,
+// drop the id so the caller can retry once on a fresh conversation — losing
+// context beats failing the request outright.
+function retryWithFreshSession(result) {
+    if (result.success || !/No conversation found with session ID/i.test(result.error || '')) {
+        return false;
+    }
+    console.warn('[Claude] Session id no longer resumable — retrying with a fresh conversation');
+    cliSessionId = null;
+    return true;
+}
+
 async function sendClaudeText(text) {
     if (!isClaudeActive) {
         return { success: false, error: 'No active Claude session' };
@@ -744,7 +804,10 @@ async function sendClaudeText(text) {
     if (claudeMode === 'cli') {
         // Use the preloaded SDK path so setup is paid during initialization,
         // while partial messages and the Claude login/session are preserved.
-        const result = await runClaudeQuery(trimmed);
+        let result = await runClaudeQuery(trimmed);
+        if (retryWithFreshSession(result)) {
+            result = await runClaudeQuery(trimmed);
+        }
         if (result.success && result.text) {
             saveConversationTurn(trimmed, result.text);
         }
@@ -790,9 +853,14 @@ async function sendClaudeImage(base64Data, prompt) {
         const tmpPath = path.join(os.tmpdir(), `cd-screen-${Date.now()}.jpg`);
         try {
             fs.writeFileSync(tmpPath, Buffer.from(base64Data, 'base64'));
-            const result = await runClaudeCli(`Read and analyze the image at ${tmpPath}. ${prompt}`, {
+            let result = await runClaudeCli(`Read and analyze the image at ${tmpPath}. ${prompt}`, {
                 allowedTools: 'Read',
             });
+            if (retryWithFreshSession(result)) {
+                result = await runClaudeCli(`Read and analyze the image at ${tmpPath}. ${prompt}`, {
+                    allowedTools: 'Read',
+                });
+            }
             if (result.success && result.text) {
                 saveScreenAnalysis(prompt, result.text, 'claude-cli');
                 return { success: true, text: result.text, model: 'claude-cli' };
@@ -857,6 +925,9 @@ function closeClaudeSession() {
     pendingTranscripts = [];
     recentHeardTranscripts = [];
     isTranscriptResponseInFlight = false;
+    lastSentTranscriptTurn = null;
+    inFlightIsSupersedable = false;
+    pendingFirstQueuedAt = 0;
     if (activeCliAbort) {
         activeCliAbort.abort();
         activeCliAbort = null;

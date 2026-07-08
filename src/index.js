@@ -40,6 +40,10 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
     stopMacOSAudioCapture();
+    // Tear down the transcription backends so neither the WhisperKit sidecar
+    // process nor the hidden WebGPU window outlives the app.
+    require('./utils/whisperkitSidecar').destroy();
+    require('./utils/whisperWindow').destroy();
 });
 
 app.on('activate', () => {
@@ -261,6 +265,15 @@ function setupStorageIpcHandlers() {
 function setupGeneralIpcHandlers() {
     ipcMain.handle('get-app-version', async () => {
         return app.getVersion();
+    });
+
+    // Lets the settings UI show whether transcription can run on the Apple
+    // Neural Engine (WhisperKit sidecar) or how to enable it.
+    ipcMain.handle('whisper-backend-info', async () => {
+        return {
+            appleSilicon: process.platform === 'darwin' && process.arch === 'arm64',
+            whisperkitInstalled: require('./utils/whisperkitSidecar').isAvailable(),
+        };
     });
 
     ipcMain.handle('quit-application', async event => {

@@ -420,6 +420,8 @@ export class CheatingDaddyApp extends LitElement {
         this._isResponseStreaming = false;
         this._awaitingNewResponse = false;
         this._currentResponseIsComplete = true;
+        this._responseWasSuperseded = false;
+        this._transcriptWasSuperseded = false;
         this.shouldAnimateResponse = false;
         this._storageLoaded = false;
         this._timerInterval = null;
@@ -480,15 +482,30 @@ export class CheatingDaddyApp extends LitElement {
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
             ipcRenderer.on('new-response', (_, response) => {
+                const replaceStalePartial = this._responseWasSuperseded;
+                this._responseWasSuperseded = false;
                 this._isResponseStreaming = true;
-                this.addNewResponse(response);
+                this.addNewResponse(response, replaceStalePartial);
             });
             ipcRenderer.on('update-response', (_, response) => this.updateCurrentResponse(response));
             ipcRenderer.on('response-complete', () => {
                 this._isResponseStreaming = false;
             });
+            // The in-flight auto-answer was aborted because the speaker kept
+            // going; the combined resend replaces the stale partial card and
+            // "Heard" entry instead of stacking junk pages per supersede.
+            ipcRenderer.on('response-superseded', () => {
+                this._responseWasSuperseded = this._responseWasSuperseded || this._isResponseStreaming;
+                this._transcriptWasSuperseded = true;
+            });
             ipcRenderer.on('new-transcript', (_, transcript) => {
-                this.transcripts = [...this.transcripts, transcript];
+                if (this._transcriptWasSuperseded && this.transcripts.length > 0) {
+                    // The combined transcript contains the superseded one.
+                    this.transcripts = [...this.transcripts.slice(0, -1), transcript];
+                } else {
+                    this.transcripts = [...this.transcripts, transcript];
+                }
+                this._transcriptWasSuperseded = false;
                 this._clearInterim();
                 this.requestUpdate();
             });
@@ -525,6 +542,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('new-response');
             ipcRenderer.removeAllListeners('update-response');
             ipcRenderer.removeAllListeners('response-complete');
+            ipcRenderer.removeAllListeners('response-superseded');
             ipcRenderer.removeAllListeners('new-transcript');
             ipcRenderer.removeAllListeners('interim-transcript');
             ipcRenderer.removeAllListeners('update-status');
@@ -583,12 +601,15 @@ export class CheatingDaddyApp extends LitElement {
         }
     }
 
-    addNewResponse(response) {
+    addNewResponse(response, replaceLast = false) {
         const wasOnLatest = this.currentResponseIndex === this.responses.length - 1;
-        this.responses = [...this.responses, response];
+        this.responses =
+            replaceLast && this.responses.length > 0 ? [...this.responses.slice(0, -1), response] : [...this.responses, response];
         if (wasOnLatest || this.currentResponseIndex === -1) {
             this.currentResponseIndex = this.responses.length - 1;
         }
+        // The index must always point at a real page, whatever path got us here.
+        this.currentResponseIndex = Math.max(0, Math.min(this.currentResponseIndex, this.responses.length - 1));
         this._awaitingNewResponse = false;
         this.requestUpdate();
     }
@@ -720,6 +741,8 @@ export class CheatingDaddyApp extends LitElement {
         this.currentResponseIndex = -1;
         this._isAudioMuted = false;
         this._isResponseStreaming = false;
+        this._responseWasSuperseded = false;
+        this._transcriptWasSuperseded = false;
         this.startTime = Date.now();
         this.sessionActive = true;
         this.currentView = 'assistant';
