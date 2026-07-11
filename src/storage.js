@@ -19,6 +19,9 @@ const DEFAULT_CREDENTIALS = {
 
 const DEFAULT_PREFERENCES = {
     customPrompt: '',
+    // Per-profile custom instructions, keyed by profile. `customPrompt` is the
+    // legacy shared value and acts as the fallback for profiles with no entry.
+    customPrompts: {},
     providerMode: 'byok',
     selectedProfile: 'interview',
     selectedLanguage: 'en-US',
@@ -32,6 +35,7 @@ const DEFAULT_PREFERENCES = {
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
     whisperModel: 'onnx-community/whisper-large-v3-turbo',
+    whisperLanguage: 'en',
     whisperFastDefaultApplied: true,
     claudeMode: 'cli',
     claudeModel: 'claude-haiku-4-5-20251001',

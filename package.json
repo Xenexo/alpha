@@ -30,6 +30,8 @@
         "@huggingface/transformers": "^3.8.1",
         "electron-squirrel-startup": "^1.0.1",
         "ollama": "^0.6.3",
+        "react": "^19.2.7",
+        "react-dom": "^19.2.7",
         "ws": "^8.19.0"
     },
     "devDependencies": {
@@ -43,6 +45,11 @@
         "@electron-forge/plugin-fuses": "^7.8.1",
         "@electron/fuses": "^1.8.0",
         "@reforged/maker-appimage": "^5.0.0",
-        "electron": "^30.0.5"
+        "@vitejs/plugin-react": "^6.0.3",
+        "autoprefixer": "^10.5.2",
+        "electron": "^30.0.5",
+        "postcss": "^8.5.16",
+        "tailwindcss": "^4.3.2",
+        "vite": "^8.1.3"
     }
 }

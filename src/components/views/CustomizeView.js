@@ -215,6 +215,8 @@ export class CustomizeView extends LitElement {
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
         this.customPrompt = '';
+        this._customPrompts = {};
+        this._legacyCustomPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
     }
@@ -230,7 +232,9 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
-            this.customPrompt = prefs.customPrompt ?? '';
+            this._customPrompts = prefs.customPrompts ?? {};
+            this._legacyCustomPrompt = prefs.customPrompt ?? '';
+            this.customPrompt = this._resolveCustomPrompt(prefs.selectedProfile || this.selectedProfile);
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
                 this.keybinds = { ...this.getDefaultKeybinds(), ...keybinds };
@@ -251,6 +255,7 @@ export class CustomizeView extends LitElement {
             { value: 'presentation', name: 'Presentation' },
             { value: 'negotiation', name: 'Negotiation' },
             { value: 'exam', name: 'Exam Assistant' },
+            { value: 'relationship', name: 'Relationship' },
         ];
     }
 
@@ -340,6 +345,18 @@ export class CustomizeView extends LitElement {
         }
     }
 
+    _resolveCustomPrompt(profile) {
+        return (this._customPrompts[profile] ?? this._legacyCustomPrompt) || '';
+    }
+
+    updated(changedProperties) {
+        // Custom instructions are per profile — swap the textarea contents
+        // whenever the selected profile changes (locally or from the parent).
+        if (changedProperties.has('selectedProfile')) {
+            this.customPrompt = this._resolveCustomPrompt(this.selectedProfile);
+        }
+    }
+
     handleProfileSelect(e) {
         this.selectedProfile = e.target.value;
         this.onProfileChange(this.selectedProfile);
@@ -362,7 +379,8 @@ export class CustomizeView extends LitElement {
 
     async handleCustomPromptInput(e) {
         this.customPrompt = e.target.value;
-        await cheatingDaddy.storage.updatePreference('customPrompt', this.customPrompt);
+        this._customPrompts = { ...this._customPrompts, [this.selectedProfile]: this.customPrompt };
+        await cheatingDaddy.storage.updatePreference('customPrompts', this._customPrompts);
     }
 
     async handleAudioModeSelect(e) {
@@ -491,6 +509,7 @@ export class CustomizeView extends LitElement {
             // Restore all preferences to defaults
             const defaults = {
                 customPrompt: '',
+                customPrompts: {},
                 selectedProfile: 'interview',
                 selectedLanguage: 'en-US',
                 selectedScreenshotInterval: '5',
@@ -522,6 +541,8 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = defaults.backgroundTransparency;
             this.googleSearchEnabled = defaults.googleSearchEnabled;
             this.customPrompt = defaults.customPrompt;
+            this._customPrompts = {};
+            this._legacyCustomPrompt = '';
             this.theme = defaults.theme;
 
             // Notify parent callbacks

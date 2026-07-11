@@ -65,11 +65,11 @@ async function loadModel(modelName) {
     }
 }
 
-async function transcribe(audio, samplingRate) {
+async function transcribe(audio, samplingRate, language) {
     if (!whisperPipeline) throw new Error('Whisper pipeline not loaded');
     const options = { sampling_rate: samplingRate || 16000 };
     if (!isEnglishOnly(activeModelName)) {
-        options.language = 'en';
+        options.language = language || 'en';
         options.task = 'transcribe';
     }
     const result = await whisperPipeline(audio, options);
@@ -86,9 +86,9 @@ ipc.on('whisper:load', async ({ id, modelName }) => {
     }
 });
 
-ipc.on('whisper:transcribe', async ({ id, audio, samplingRate }) => {
+ipc.on('whisper:transcribe', async ({ id, audio, samplingRate, language }) => {
     try {
-        const text = await transcribe(audio, samplingRate);
+        const text = await transcribe(audio, samplingRate, language);
         ipc.send('whisper:result', { id, text });
     } catch (error) {
         log('Transcribe error:', error);

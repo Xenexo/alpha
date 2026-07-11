@@ -1,4 +1,13 @@
-const { GoogleGenAI, Modality } = require('@google/genai');
+let _GoogleGenAI = null;
+let _Modality = null;
+function getGenAI() {
+    if (!_GoogleGenAI) {
+        const genai = require('@google/genai');
+        _GoogleGenAI = genai.GoogleGenAI;
+        _Modality = genai.Modality;
+    }
+    return { GoogleGenAI: _GoogleGenAI, Modality: _Modality };
+}
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
@@ -417,6 +426,7 @@ async function sendToGeminiText(transcription) {
     const trimmedHistory = trimConversationHistoryForGemma(groqConversationHistory, 42000);
 
     try {
+        const { GoogleGenAI } = getGenAI();
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
         const messages = trimmedHistory.map(msg => ({
@@ -496,6 +506,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         reconnectAttempts = 0;
     }
 
+    const { GoogleGenAI } = getGenAI();
     const client = new GoogleGenAI({
         vertexai: false,
         apiKey: apiKey,
@@ -596,7 +607,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 },
             },
             config: {
-                responseModalities: [Modality.AUDIO],
+                responseModalities: [getGenAI().Modality.AUDIO],
                 proactivity: { proactiveAudio: true },
                 outputAudioTranscription: {},
                 tools: enabledTools,
@@ -869,6 +880,7 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
     }
 
     try {
+        const { GoogleGenAI } = getGenAI();
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
         const contents = [

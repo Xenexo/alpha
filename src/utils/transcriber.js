@@ -3,15 +3,22 @@
 const { sendToRenderer } = require('./gemini');
 const whisperWindow = require('./whisperWindow');
 const whisperkitSidecar = require('./whisperkitSidecar');
+const storage = require('../storage');
 
 // ── State ──
 
 let whisperPipeline = null; // CPU-backend pipeline (only set when backend==='cpu')
 let backend = null; // 'ane' | 'webgpu' | 'cpu' — null until a model is loaded
+let whisperLanguage = 'en'; // 'en' | 'hi' — from the whisperLanguage preference, read at init
 let isWhisperLoading = false;
 let onTranscript = null;
 let isTranscribing = false;
-let pendingAudioJob = null;
+// FIFO of audio segments awaiting transcription. Split segments of one long
+// utterance are all parts of the same question, so they must queue rather
+// than replace each other; the cap only sheds load when inference falls
+// hopelessly behind.
+let pendingAudioJobs = [];
+const MAX_PENDING_AUDIO_JOBS = 4;
 let transcriptionGeneration = 0;
 
 // VAD state
@@ -33,6 +40,22 @@ let preSpeechBuffer = [];
 const INTERIM_INTERVAL_FRAMES = 15;
 let lastInterimFrameCount = 0;
 
+// Continuous speech with no VAD-length pause (a video, a monologue) would
+// otherwise accumulate without bound — inference time grows with audio length,
+// so interims were observed taking 20s+ on ~50s buffers and the final answer
+// couldn't even start until the speaker stopped. Split the utterance into
+// bounded segments instead: prefer splitting at a sub-threshold frame (a
+// micro-pause) once past the soft cap, force a split at the hard cap. Whisper
+// quality also degrades past ~30s, so the cap helps accuracy too.
+const SOFT_SPLIT_FRAMES = 120; // ~12s: split at the next quiet frame
+const HARD_SPLIT_FRAMES = 180; // ~18s: split unconditionally
+// Carry a little trailing audio into the next segment so it doesn't start
+// cold mid-word (hallucination risk, same reason as preSpeechBuffer).
+const SPLIT_OVERLAP_FRAMES = 5;
+// Interims are disposable live captions — transcribing the whole buffer makes
+// each one slower than the last for no benefit. Only the recent tail matters.
+const INTERIM_MAX_FRAMES = 100; // ~10s
+
 // VAD configuration
 const VAD_MODES = {
     NORMAL: { energyThreshold: 0.01, speechFramesRequired: 3, silenceFramesRequired: 30 },
@@ -45,7 +68,7 @@ const VAD_MODES = {
     // accurate with complete-utterance context. Interviewers routinely pause
     // 0.5-1.0s mid-sentence, so 15 frames keeps partial phrases out of the
     // transcript queue without adding perceptible latency to genuine turn-ends.
-    BALANCED: { energyThreshold: 0.007, speechFramesRequired: 2, silenceFramesRequired: 5 },
+    BALANCED: { energyThreshold: 0.007, speechFramesRequired: 2, silenceFramesRequired: 3 },
 };
 let vadConfig = VAD_MODES.BALANCED;
 
@@ -152,6 +175,19 @@ function processVAD(pcm16kBuffer) {
     if (isSpeaking) {
         speechBuffers.push(Buffer.from(pcm16kBuffer));
 
+        // Bound the utterance: split long continuous speech into segments so
+        // transcription (and the answer) starts while the speaker is still
+        // going, instead of one giant slow inference at the very end.
+        if (speechBuffers.length >= HARD_SPLIT_FRAMES || (speechBuffers.length >= SOFT_SPLIT_FRAMES && !isVoice)) {
+            console.log('[Transcriber] Long utterance — splitting segment at', speechBuffers.length, 'chunks');
+            const audioData = Buffer.concat(speechBuffers);
+            const overlap = speechBuffers.slice(-SPLIT_OVERLAP_FRAMES);
+            speechBuffers = overlap.map(b => Buffer.from(b));
+            lastInterimFrameCount = speechBuffers.length;
+            queueTranscription(audioData);
+            return;
+        }
+
         // Emit a live partial transcript roughly every INTERIM_INTERVAL_FRAMES.
         // runInterim self-throttles if the pipeline is still busy, so advancing
         // the counter here (even when an interim is skipped) just means the next
@@ -173,7 +209,7 @@ async function runInterim() {
 
     isTranscribing = true;
     const generation = transcriptionGeneration;
-    const snapshot = Buffer.concat(speechBuffers);
+    const snapshot = Buffer.concat(speechBuffers.slice(-INTERIM_MAX_FRAMES));
 
     try {
         const text = await transcribeAudio(snapshot);
@@ -184,11 +220,7 @@ async function runInterim() {
         }
     } finally {
         isTranscribing = false;
-        const queued = pendingAudioJob;
-        pendingAudioJob = null;
-        if (queued && queued.generation === transcriptionGeneration) {
-            queueTranscription(queued.audioData);
-        }
+        drainTranscriptionQueue();
     }
 }
 
@@ -234,7 +266,7 @@ async function loadWhisperPipeline(modelName) {
     try {
         if (whisperkitSidecar.isAvailable()) {
             console.log('[Transcriber] Loading Whisper on the Neural Engine (WhisperKit):', modelName);
-            await whisperkitSidecar.loadModel(modelName);
+            await whisperkitSidecar.loadModel(modelName, whisperLanguage);
             backend = 'ane';
             console.log('[Transcriber] Whisper model loaded on the Neural Engine');
             sendToRenderer('whisper-downloading', false);
@@ -280,7 +312,7 @@ async function loadWhisperPipeline(modelName) {
         // silence is enough to compile the encoder/decoder path.
         try {
             const warmStart = Date.now();
-            await whisperPipeline(new Float32Array(16000), { sampling_rate: 16000, language: 'en', task: 'transcribe' });
+            await whisperPipeline(new Float32Array(16000), { sampling_rate: 16000, language: whisperLanguage, task: 'transcribe' });
             console.log(`[Transcriber] Warmup completed in ${Date.now() - warmStart}ms`);
         } catch (warmupError) {
             console.warn('[Transcriber] Warmup inference failed (non-fatal):', warmupError.message);
@@ -369,15 +401,15 @@ async function transcribeAudio(pcm16kBuffer) {
         let text;
         if (backend === 'ane') {
             // Inference runs on the Apple Neural Engine in the WhisperKit sidecar.
-            text = await whisperkitSidecar.transcribe(float32Audio, 16000);
+            text = await whisperkitSidecar.transcribe(float32Audio, 16000, whisperLanguage);
         } else if (backend === 'webgpu') {
             // Inference runs on the Apple GPU in the hidden Whisper window.
-            text = await whisperWindow.transcribe(float32Audio, 16000);
+            text = await whisperWindow.transcribe(float32Audio, 16000, whisperLanguage);
         } else {
             // Whisper expects audio at 16kHz which is what we have
             const result = await whisperPipeline(float32Audio, {
                 sampling_rate: 16000,
-                language: 'en',
+                language: whisperLanguage,
                 task: 'transcribe',
                 // Block the decoder from repeating any 3-gram — the primary guard
                 // against "this is this is this is…" loops.
@@ -423,39 +455,44 @@ async function handleSpeechEnd(audioData, generation) {
     }
 }
 
-async function queueTranscription(audioData) {
-    // Whisper inference is expensive. Never run overlapping inference jobs;
-    // when speech arrives faster than it can be processed, retain only the
-    // newest segment instead of building an increasingly stale backlog.
-    if (isTranscribing) {
-        pendingAudioJob = { audioData, generation: transcriptionGeneration };
-        return;
+function queueTranscription(audioData) {
+    pendingAudioJobs.push({ audioData, generation: transcriptionGeneration });
+    // Whisper inference is expensive; if it falls hopelessly behind, shed the
+    // oldest segment rather than building an ever-staler backlog.
+    if (pendingAudioJobs.length > MAX_PENDING_AUDIO_JOBS) {
+        console.warn('[Transcriber] Transcription backlog full — dropping oldest segment');
+        pendingAudioJobs.shift();
     }
+    drainTranscriptionQueue();
+}
+
+// Never run overlapping inference jobs: a single drainer processes the queue
+// in order, and whoever finishes an inference (final or interim) re-kicks it.
+async function drainTranscriptionQueue() {
+    if (isTranscribing || pendingAudioJobs.length === 0) return;
 
     isTranscribing = true;
-    let job = { audioData, generation: transcriptionGeneration };
-
     try {
-        while (job) {
-            pendingAudioJob = null;
-            if (job.generation === transcriptionGeneration) {
-                await handleSpeechEnd(job.audioData, job.generation);
-            }
-            job = pendingAudioJob;
+        while (pendingAudioJobs.length > 0) {
+            const job = pendingAudioJobs.shift();
+            if (job.generation !== transcriptionGeneration) continue;
+            await handleSpeechEnd(job.audioData, job.generation);
         }
     } finally {
         isTranscribing = false;
-        const queuedJob = pendingAudioJob;
-        pendingAudioJob = null;
-        if (queuedJob && queuedJob.generation === transcriptionGeneration) {
-            queueTranscription(queuedJob.audioData);
-        }
+        if (pendingAudioJobs.length > 0) drainTranscriptionQueue();
     }
 }
 
 // ── Public API ──
 
 async function initWhisper(modelName) {
+    try {
+        whisperLanguage = storage.getPreferences().whisperLanguage || 'en';
+    } catch (error) {
+        console.warn('[Transcriber] Could not read whisperLanguage preference, defaulting to en:', error.message);
+        whisperLanguage = 'en';
+    }
     return await loadWhisperPipeline(modelName);
 }
 
@@ -495,7 +532,7 @@ function flush() {
 // an utterance is being (or waiting to be) transcribed. Lets the consumer hold
 // off sending a "complete" question to the AI while the speaker is mid-turn.
 function isPipelineBusy() {
-    return isSpeaking || isTranscribing || pendingAudioJob !== null;
+    return isSpeaking || isTranscribing || pendingAudioJobs.length > 0;
 }
 
 function resetTranscriber() {
@@ -507,7 +544,7 @@ function resetTranscriber() {
     speechFrameCount = 0;
     lastInterimFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
-    pendingAudioJob = null;
+    pendingAudioJobs = [];
     onTranscript = null;
     // Note: whisperPipeline is kept loaded to avoid reloading on next session
 }

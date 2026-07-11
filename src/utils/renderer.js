@@ -143,11 +143,17 @@ function arrayBufferToBase64(buffer) {
     return btoa(binary);
 }
 
+// Custom instructions are stored per profile in `customPrompts`; the legacy
+// shared `customPrompt` is the fallback for profiles without their own entry.
+function resolveCustomPrompt(prefs, profile) {
+    return ((prefs.customPrompts || {})[profile] ?? prefs.customPrompt) || '';
+}
+
 async function initializeGemini(profile = 'interview', language = 'en-US') {
     const apiKey = await storage.getApiKey();
     if (apiKey) {
         const prefs = await storage.getPreferences();
-        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
+        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, resolveCustomPrompt(prefs, profile), profile, language);
         if (success) {
             cheatingDaddy.setStatus('Live');
         } else {
@@ -161,7 +167,7 @@ async function initializeLocal(profile = 'interview') {
     const ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
     const ollamaModel = prefs.ollamaModel || 'llama3.1';
     const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
-    const customPrompt = prefs.customPrompt || '';
+    const customPrompt = resolveCustomPrompt(prefs, profile);
 
     const success = await ipcRenderer.invoke('initialize-local', ollamaHost, ollamaModel, whisperModel, profile, customPrompt);
     if (success) {
@@ -179,7 +185,7 @@ async function initializeClaude(profile = 'interview') {
     const claudeMode = prefs.claudeMode || 'cli';
     const claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
     const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
-    const customPrompt = prefs.customPrompt || '';
+    const customPrompt = resolveCustomPrompt(prefs, profile);
 
     const success = await ipcRenderer.invoke(
         'initialize-claude',
@@ -208,7 +214,7 @@ async function initializeCloud(profile = 'interview') {
     }
 
     const prefs = await storage.getPreferences();
-    const success = await ipcRenderer.invoke('initialize-cloud', token, profile, prefs.customPrompt || '');
+    const success = await ipcRenderer.invoke('initialize-cloud', token, profile, resolveCustomPrompt(prefs, profile));
     if (success) {
         cheatingDaddy.setStatus('Live');
         return true;

@@ -95,7 +95,8 @@ export class CheatingDaddyApp extends LitElement {
         .sidebar {
             width: var(--sidebar-width);
             min-width: var(--sidebar-width);
-            background: var(--bg-surface);
+            background: rgba(24, 24, 27, 0.4);
+            backdrop-filter: var(--blur-backdrop);
             border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
@@ -122,9 +123,11 @@ export class CheatingDaddyApp extends LitElement {
         }
 
         .sidebar-brand h1 {
-            font-size: var(--font-size-sm);
-            font-weight: var(--font-weight-semibold);
-            color: var(--text-primary);
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-bold);
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
             letter-spacing: -0.01em;
         }
 
@@ -147,10 +150,8 @@ export class CheatingDaddyApp extends LitElement {
             font-size: var(--font-size-sm);
             font-weight: var(--font-weight-medium);
             cursor: pointer;
-            transition:
-                color var(--transition),
-                background var(--transition);
-            border: none;
+            transition: all var(--transition);
+            border: 1px solid transparent;
             background: none;
             width: 100%;
             text-align: left;
@@ -158,12 +159,16 @@ export class CheatingDaddyApp extends LitElement {
 
         .nav-item:hover {
             color: var(--text-primary);
-            background: var(--bg-hover);
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.1);
+            transform: translateX(4px);
         }
 
         .nav-item.active {
             color: var(--text-primary);
-            background: var(--bg-elevated);
+            background: rgba(99, 102, 241, 0.15);
+            border-color: rgba(99, 102, 241, 0.3);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.1);
         }
 
         .nav-item svg {
@@ -242,7 +247,8 @@ export class CheatingDaddyApp extends LitElement {
             overflow: hidden;
             display: flex;
             flex-direction: column;
-            background: var(--bg-app);
+            background: url('data:image/svg+xml;utf8,<svg width="20" height="20" xmlns="http://www.w3.org/2000/svg"><circle cx="2" cy="2" r="1" fill="rgba(255,255,255,0.03)"/></svg>');
+            background-color: var(--bg-app);
         }
 
         /* Live mode top bar */
@@ -252,9 +258,10 @@ export class CheatingDaddyApp extends LitElement {
             align-items: center;
             justify-content: space-between;
             padding: 0 var(--space-md);
-            background: var(--bg-surface);
+            background: rgba(24, 24, 27, 0.65);
+            backdrop-filter: var(--blur-backdrop);
             border-bottom: 1px solid var(--border);
-            height: 36px;
+            height: 48px;
             -webkit-app-region: drag;
         }
 
@@ -1036,6 +1043,7 @@ export class CheatingDaddyApp extends LitElement {
             presentation: 'Presentation',
             negotiation: 'Negotiation',
             exam: 'Exam',
+            relationship: 'Relationship',
         };
 
         return html`

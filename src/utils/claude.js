@@ -1,4 +1,8 @@
-const Anthropic = require('@anthropic-ai/sdk');
+let _Anthropic = null;
+function getAnthropic() {
+    if (!_Anthropic) _Anthropic = require('@anthropic-ai/sdk');
+    return _Anthropic;
+}
 const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -31,6 +35,31 @@ let lastSentTranscriptTurn = null; // text of the in-flight auto request, for re
 let inFlightIsSupersedable = false; // only flushPendingTranscripts-initiated requests
 let pendingFirstQueuedAt = 0; // when the oldest pending fragment arrived
 const MAX_FLUSH_HOLD_MS = 3000;
+// During continuous speech a new transcript lands every few seconds — if each
+// one were allowed to abort the in-flight answer, no answer would ever finish
+// (the exact "listening but never answering" failure). Cap how many times one
+// answer chain can be superseded; after that the answer runs to completion and
+// the newer speech is flushed as the next turn.
+let supersedeCount = 0;
+const MAX_SUPERSEDES = 2;
+// When the answer request started, for stall detection. The runClaudeQuery
+// watchdog should always unwind a hung request; if that ever fails, a stuck
+// isTranscriptResponseInFlight would silently block every future answer, so
+// force-clear it after the watchdog deadline plus slack.
+let inFlightStartedAt = 0;
+const IN_FLIGHT_STALL_MS = 135000;
+
+function clearStalledInFlight() {
+    if (!isTranscriptResponseInFlight || !inFlightStartedAt) return;
+    const age = Date.now() - inFlightStartedAt;
+    if (age <= IN_FLIGHT_STALL_MS) return;
+    console.error(`[Claude] In-flight response stalled for ${age}ms — force-clearing so answers resume`);
+    isTranscriptResponseInFlight = false;
+    inFlightIsSupersedable = false;
+    lastSentTranscriptTurn = null;
+    inFlightStartedAt = 0;
+    if (activeCliAbort) activeCliAbort.abort();
+}
 // Rolling window of everything recently heard — including fragments suppressed
 // by isMeaningfulTranscript — so the user can manually ask Claude to answer
 // speech that was heard but not auto-answered (see answerWithContext).
@@ -41,15 +70,20 @@ const RECENT_HEARD_MAX = 8;
 // produced, so this debounce only needs to catch transcripts split across that
 // boundary — not re-wait for the user to finish. Keep it short so Claude is
 // contacted promptly; raising it adds pure latency before every response.
-const TRANSCRIPT_DEBOUNCE_MS = 250;
+const TRANSCRIPT_DEBOUNCE_MS = 100;
 const RESPONSE_UPDATE_INTERVAL_MS = 50;
 
 // Claude Code CLI state
-let cliPath = null;
+let cliPath = null; // resolved lazily on first subprocess use (image path)
 let cliEnv = null;
 let cliSessionId = null; // session_id from SDK / --resume, keeps conversation context
 let activeCliProc = null; // subprocess handle (image path only)
 let activeCliAbort = null; // AbortController for in-flight SDK query (text path)
+const CLI_TIMEOUT_MS = 120000;
+// Watchdog for SDK queries. A hung request would otherwise keep
+// isTranscriptResponseInFlight true forever and silently stop all answers.
+const QUERY_TIMEOUT_MS = 120000;
+const WARMUP_TIMEOUT_MS = 15000;
 
 // Lazy-loaded @anthropic-ai/claude-code query function
 let _queryFn = null;
@@ -61,7 +95,6 @@ async function getQueryFn() {
     return _queryFn;
 }
 
-const CLI_TIMEOUT_MS = 120000;
 const API_MAX_TOKENS = 2048;
 const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 
@@ -79,6 +112,20 @@ const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 - The input is a live speech transcript that may contain mis-heard words, filler, or background chatter. Answer only the actual question or request; ignore acknowledgements, greetings, and small talk ("thanks", "okay", "got it", "bye").
 - If the transcript is not a genuine question or request, or is too garbled/out-of-context to answer confidently, reply with nothing rather than guessing or improvising an unrelated answer.
 - Never respond with pleasantries such as "You're welcome", "No problem", or "Glad to help" — these are not answers.
+`;
+
+// Conversational profiles (relationship) need proactive suggestions on
+// statements and stories — the exact behavior the concise ruleset suppresses —
+// so they get this variant instead. Noise/garble handling stays identical.
+const CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT = `
+
+**CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
+- Start with the exact words to say. Do not add an introduction, restate what was heard, or explain your suggestion.
+- Respond in 1-3 short sentences and then stop.
+- If she asks a question, answer it directly in a natural conversational way.
+- If she shares a genuine statement, story, or feeling, suggest what to say back — an engaged response ending in a follow-up question or a fresh topic to keep the call going.
+- Reply in the same language/mix as the transcript (Hinglish stays Hinglish, English stays English).
+- The input is a live speech transcript that may contain mis-heard words, filler, or background chatter. If the transcript is pure noise, too garbled to understand, or clearly background speech, reply with nothing rather than guessing.
 `;
 
 // Whisper hallucinates stock phrases on silence/noise (subtitle artifacts) and
@@ -111,7 +158,13 @@ function isMeaningfulTranscript(text) {
 
 async function flushPendingTranscripts() {
     transcriptDebounceTimer = null;
-    if (!isClaudeActive || isTranscriptResponseInFlight || pendingTranscripts.length === 0) return;
+    clearStalledInFlight();
+    if (!isClaudeActive || isTranscriptResponseInFlight || pendingTranscripts.length === 0) {
+        if (pendingTranscripts.length > 0) {
+            console.log('[Claude] Flush deferred —', !isClaudeActive ? 'session not active' : 'response already in flight');
+        }
+        return;
+    }
 
     // The speaker is still mid-turn (VAD hears speech, or an utterance is being
     // transcribed) — more text is imminent, so hold the flush and let it merge
@@ -126,9 +179,14 @@ async function flushPendingTranscripts() {
     pendingTranscripts = [];
     if (!transcription) return;
     // Guard the merged turn too: several filler fragments can debounce together.
-    if (!isMeaningfulTranscript(transcription)) return;
+    if (!isMeaningfulTranscript(transcription)) {
+        console.log('[Claude] Merged transcript filtered as noise/filler:', transcription);
+        return;
+    }
 
+    console.log('[Claude] Flushing transcript to Claude:', transcription.substring(0, 80));
     isTranscriptResponseInFlight = true;
+    inFlightStartedAt = Date.now();
     lastSentTranscriptTurn = transcription;
     inFlightIsSupersedable = true;
     // Surface what was heard so the live view can show which question each
@@ -137,14 +195,30 @@ async function flushPendingTranscripts() {
     sendToRenderer('update-status', 'Generating response...');
 
     try {
-        await sendClaudeText(transcription);
-        // This speech has been answered; don't let a later manual trigger
-        // re-answer it. Keep only fragments heard after this turn started.
-        recentHeardTranscripts = [];
+        const result = await sendClaudeText(transcription);
+        if (result.success) {
+            // This speech has been answered; don't let a later manual trigger
+            // re-answer it. Keep only fragments heard after this turn started.
+            recentHeardTranscripts = [];
+            supersedeCount = 0;
+        } else if (result.error !== 'Cancelled') {
+            // The chain ended (not superseded) — next answer starts fresh.
+            supersedeCount = 0;
+            if (/no response/i.test(result.error || '')) {
+                // Claude followed the "reply with nothing for garbled speech"
+                // rule. Tell the user instead of leaving "Generating response..."
+                // stuck, and point at the manual override.
+                sendToRenderer(
+                    'update-status',
+                    `No answer — speech may be unclear. Press ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G to force an answer`
+                );
+            }
+        }
     } finally {
         isTranscriptResponseInFlight = false;
         inFlightIsSupersedable = false;
         lastSentTranscriptTurn = null;
+        inFlightStartedAt = 0;
         if (isClaudeActive && pendingTranscripts.length > 0) {
             transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
         }
@@ -152,7 +226,10 @@ async function flushPendingTranscripts() {
 }
 
 function queueTranscript(transcription) {
-    if (!isClaudeActive) return;
+    if (!isClaudeActive) {
+        console.log('[Claude] Transcript dropped — session not active yet:', transcription.substring(0, 60));
+        return;
+    }
     // Remember everything heard (even suppressed fragments) so the user can
     // later force an answer on out-of-context speech via answerWithContext.
     const heard = transcription.trim();
@@ -165,6 +242,7 @@ function queueTranscript(transcription) {
     // Drop hallucinated/filler fragments so they neither show as a "question"
     // nor trigger a response. Real fragments still merge via the debounce.
     if (!isMeaningfulTranscript(transcription)) {
+        console.log('[Claude] Transcript filtered as noise/filler:', heard.substring(0, 60));
         if (heard)
             sendToRenderer(
                 'update-status',
@@ -180,8 +258,16 @@ function queueTranscript(transcription) {
     // by the real question): abort it and let the finally-re-flush resend the
     // already-sent text combined with the new speech as one prompt. Manual
     // answers (answerWithContext) are never aborted.
+    clearStalledInFlight();
     if (isTranscriptResponseInFlight) {
-        if (inFlightIsSupersedable) {
+        console.log(
+            `[Claude] Response in flight (${Math.round((Date.now() - inFlightStartedAt) / 1000)}s, ` +
+                `supersedes ${supersedeCount}/${MAX_SUPERSEDES}) — new transcript ${
+                    inFlightIsSupersedable && supersedeCount < MAX_SUPERSEDES ? 'supersedes it' : 'will flush after'
+                }`
+        );
+        if (inFlightIsSupersedable && supersedeCount < MAX_SUPERSEDES) {
+            supersedeCount++;
             if (lastSentTranscriptTurn) {
                 pendingTranscripts.unshift(lastSentTranscriptTurn);
                 lastSentTranscriptTurn = null; // no double-prepend on rapid supersedes
@@ -226,6 +312,7 @@ async function answerWithContext() {
     }
 
     isTranscriptResponseInFlight = true;
+    inFlightStartedAt = Date.now();
     // An explicitly requested answer must never be aborted by new speech.
     inFlightIsSupersedable = false;
     sendToRenderer('new-transcript', speech);
@@ -250,6 +337,7 @@ async function answerWithContext() {
         return result;
     } finally {
         isTranscriptResponseInFlight = false;
+        inFlightStartedAt = 0;
         if (isClaudeActive && pendingTranscripts.length > 0) {
             transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
         }
@@ -303,7 +391,18 @@ async function resolveClaudeCli() {
 
 // ── Claude Code CLI invocation ──
 
-function runClaudeCli(prompt, { allowedTools } = {}) {
+async function runClaudeCli(prompt, { allowedTools } = {}) {
+    // The SDK path handles all text requests, so the CLI binary is only
+    // resolved here, on first subprocess use (image analysis).
+    if (!cliPath) {
+        const cli = await resolveClaudeCli();
+        if (!cli) {
+            sendToRenderer('update-status', 'Claude CLI not found — install Claude Code or switch to API key mode');
+            return { success: false, error: 'Claude CLI not found' };
+        }
+        cliPath = cli.path;
+        cliEnv = cli.env;
+    }
     return new Promise(resolve => {
         const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', claudeModel];
         // Replace Claude Code's large coding-agent prompt. This app needs a
@@ -458,19 +557,27 @@ function runClaudeCli(prompt, { allowedTools } = {}) {
 
 // quiet: suppress all renderer/status events. Used by the init warm-up so it
 // primes the agent runtime without flickering the UI or showing a response.
-async function runClaudeQuery(prompt, { quiet = false } = {}) {
+async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT_MS } = {}) {
     const requestStartedAt = Date.now();
     let firstTokenLogged = false;
     let query;
     try {
         query = await getQueryFn();
     } catch (importErr) {
-        console.warn('[Claude] SDK import failed, falling back to CLI:', importErr.message);
-        return runClaudeCli(prompt);
+        console.error('[Claude] SDK import failed:', importErr.message);
+        return { success: false, error: 'Failed to load Claude SDK' };
     }
 
     const controller = new AbortController();
     activeCliAbort = controller;
+    // A query that never yields (network stall, SDK hang) would otherwise pin
+    // isTranscriptResponseInFlight forever and no answer would ever appear again.
+    let timedOut = false;
+    const watchdog = setTimeout(() => {
+        timedOut = true;
+        console.error(`[Claude] Query timed out after ${timeoutMs}ms — aborting`);
+        controller.abort();
+    }, timeoutMs);
 
     let committed = '';
     let delta = '';
@@ -572,7 +679,10 @@ async function runClaudeQuery(prompt, { quiet = false } = {}) {
             }
         }
     } catch (err) {
-        if (controller.signal.aborted) return { success: false, error: 'Cancelled' };
+        if (controller.signal.aborted) {
+            if (timedOut && !quiet) sendToRenderer('update-status', 'Claude timed out — listening again');
+            return { success: false, error: timedOut ? 'Claude timed out' : 'Cancelled' };
+        }
         console.error('[Claude] SDK query error:', err);
         let message = 'Claude error: ' + err.message;
         if (/login|auth|unauthorized|401|credentials/i.test(err.message)) {
@@ -581,13 +691,17 @@ async function runClaudeQuery(prompt, { quiet = false } = {}) {
         if (!quiet) sendToRenderer('update-status', message);
         return { success: false, error: message };
     } finally {
+        clearTimeout(watchdog);
         if (responseUpdateTimer) clearTimeout(responseUpdateTimer);
         if (activeCliAbort === controller) activeCliAbort = null;
     }
 
     // An abort can land between stream messages and exit the loop via `break`
     // with partial text — don't let that be saved/rendered as a success.
-    if (controller.signal.aborted) return { success: false, error: 'Cancelled' };
+    if (controller.signal.aborted) {
+        if (timedOut && !quiet) sendToRenderer('update-status', 'Claude timed out — listening again');
+        return { success: false, error: timedOut ? 'Claude timed out' : 'Cancelled' };
+    }
     if (!fullText) return { success: false, error: 'Claude returned no response' };
     console.log(`[Claude] Response completed in ${Date.now() - requestStartedAt}ms`);
     if (!quiet) sendToRenderer('update-status', 'Listening...');
@@ -603,7 +717,10 @@ async function warmUpClaude() {
     if (claudeMode !== 'cli') return;
     const startedAt = Date.now();
     try {
-        const result = await runClaudeQuery('Reply with the single word: ready', { quiet: true });
+        // Short timeout: session activation awaits this, and while the session
+        // is inactive every transcript is silently dropped — a hung warm-up
+        // must never keep the app listening-but-mute for long.
+        const result = await runClaudeQuery('Reply with the single word: ready', { quiet: true, timeoutMs: WARMUP_TIMEOUT_MS });
         if (result.success) {
             console.log(`[Claude] Warm-up completed in ${Date.now() - startedAt}ms`);
         } else {
@@ -643,6 +760,7 @@ async function streamAnthropicMessages(messages) {
 }
 
 function anthropicErrorMessage(error) {
+    const Anthropic = getAnthropic();
     if (error instanceof Anthropic.AuthenticationError) {
         return 'Invalid Anthropic API key';
     }
@@ -664,7 +782,8 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
     try {
         claudeMode = mode === 'api' ? 'api' : 'cli';
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + CLAUDE_CONCISE_RESPONSE_PROMPT;
+        const realtimeRules = profile === 'relationship' ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT : CLAUDE_CONCISE_RESPONSE_PROMPT;
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + realtimeRules;
         claudeConversationHistory = [];
         cliSessionId = null;
 
@@ -676,29 +795,21 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         let warmUpPromise = null;
 
         if (claudeMode === 'cli') {
-            const cli = await resolveClaudeCli();
-            if (!cli) {
+            try {
+                await getQueryFn();
+                warmUpPromise = warmUpClaude();
+            } catch (error) {
                 sendToRenderer('session-initializing', false);
-                sendToRenderer('update-status', 'Claude CLI not found — install Claude Code or switch to API key mode');
+                sendToRenderer('update-status', 'Claude SDK failed to load. Please ensure it is installed.');
                 return false;
             }
-            cliPath = cli.path;
-            cliEnv = cli.env;
-
-            // Import once during setup instead of adding module-load latency to
-            // the first user request. Failure is harmless: runClaudeQuery falls
-            // back to the subprocess implementation.
-            await getQueryFn().catch(error => {
-                console.warn('[Claude] SDK preload failed; CLI fallback will be used:', error.message);
-            });
-
-            warmUpPromise = warmUpClaude();
         } else {
             if (!anthropicApiKey || !anthropicApiKey.trim()) {
                 sendToRenderer('session-initializing', false);
                 sendToRenderer('update-status', 'Anthropic API key required');
                 return false;
             }
+            const Anthropic = getAnthropic();
             anthropicClient = new Anthropic({ apiKey: anthropicApiKey.trim() });
         }
 
@@ -928,6 +1039,8 @@ function closeClaudeSession() {
     lastSentTranscriptTurn = null;
     inFlightIsSupersedable = false;
     pendingFirstQueuedAt = 0;
+    supersedeCount = 0;
+    inFlightStartedAt = 0;
     if (activeCliAbort) {
         activeCliAbort.abort();
         activeCliAbort = null;

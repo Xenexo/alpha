@@ -46,26 +46,44 @@ export class AICustomizeView extends LitElement {
         this.selectedProfile = 'interview';
         this.onProfileChange = () => {};
         this._context = '';
+        this._customPrompts = {};
+        this._legacyCustomPrompt = '';
         this._loadFromStorage();
     }
 
     async _loadFromStorage() {
         try {
             const prefs = await cheatingDaddy.storage.getPreferences();
-            this._context = prefs.customPrompt || '';
+            this._customPrompts = prefs.customPrompts || {};
+            this._legacyCustomPrompt = prefs.customPrompt || '';
+            this._context = this._resolveContext(prefs.selectedProfile || this.selectedProfile);
             this.requestUpdate();
         } catch (error) {
             console.error('Error loading AI customize storage:', error);
         }
     }
 
+    _resolveContext(profile) {
+        return (this._customPrompts[profile] ?? this._legacyCustomPrompt) || '';
+    }
+
+    updated(changedProperties) {
+        // Context is per profile — swap the textarea contents whenever the
+        // selected profile changes (locally or from the parent).
+        if (changedProperties.has('selectedProfile')) {
+            this._context = this._resolveContext(this.selectedProfile);
+        }
+    }
+
     _handleProfileChange(e) {
+        this.selectedProfile = e.target.value;
         this.onProfileChange(e.target.value);
     }
 
     async _saveContext(val) {
         this._context = val;
-        await cheatingDaddy.storage.updatePreference('customPrompt', val);
+        this._customPrompts = { ...this._customPrompts, [this.selectedProfile]: val };
+        await cheatingDaddy.storage.updatePreference('customPrompts', this._customPrompts);
     }
 
     _getProfileName(profile) {
@@ -76,6 +94,7 @@ export class AICustomizeView extends LitElement {
             presentation: 'Presentation',
             negotiation: 'Negotiation',
             exam: 'Exam Assistant',
+            relationship: 'Relationship',
         };
         return names[profile] || profile;
     }
@@ -88,6 +107,7 @@ export class AICustomizeView extends LitElement {
             { value: 'presentation', label: 'Presentation' },
             { value: 'negotiation', label: 'Negotiation' },
             { value: 'exam', label: 'Exam Assistant' },
+            { value: 'relationship', label: 'Relationship' },
         ];
 
         return html`

@@ -519,6 +519,7 @@ export class MainView extends LitElement {
         _ollamaHost: { state: true },
         _ollamaModel: { state: true },
         _whisperModel: { state: true },
+        _whisperLanguage: { state: true },
         _showLocalHelp: { state: true },
         // Claude state
         _claudeMode: { state: true },
@@ -548,6 +549,7 @@ export class MainView extends LitElement {
         this._ollamaHost = 'http://127.0.0.1:11434';
         this._ollamaModel = 'llama3.1';
         this._whisperModel = 'Xenova/whisper-tiny';
+        this._whisperLanguage = 'en';
         this._claudeMode = 'cli';
         this._anthropicKey = '';
         this._claudeModel = 'claude-haiku-4-5-20251001';
@@ -589,6 +591,7 @@ export class MainView extends LitElement {
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
             this._whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
+            this._whisperLanguage = prefs.whisperLanguage || 'en';
 
             // Load Claude settings
             this._claudeMode = prefs.claudeMode || 'cli';
@@ -785,6 +788,12 @@ export class MainView extends LitElement {
     async _saveWhisperModel(val) {
         this._whisperModel = val;
         await cheatingDaddy.storage.updatePreference('whisperModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveWhisperLanguage(val) {
+        this._whisperLanguage = val;
+        await cheatingDaddy.storage.updatePreference('whisperLanguage', val);
         this.requestUpdate();
     }
 
@@ -1030,6 +1039,14 @@ export class MainView extends LitElement {
                     ${this.whisperDownloading ? 'Downloading model...' : 'Used for speech-to-text, downloaded automatically on first use'}
                 </div>
                 ${this._renderAneHint()}
+            </div>
+            <div class="form-group">
+                <label class="form-label">Transcription Language</label>
+                <select .value=${this._whisperLanguage} @change=${e => this._saveWhisperLanguage(e.target.value)}>
+                    <option value="en" ?selected=${this._whisperLanguage === 'en'}>English</option>
+                    <option value="hi" ?selected=${this._whisperLanguage === 'hi'}>Hindi</option>
+                </select>
+                <div class="form-hint">Language Whisper listens for — pick Hindi for Hindi/Hinglish calls</div>
             </div>
         `;
     }

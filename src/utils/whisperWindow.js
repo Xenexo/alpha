@@ -107,9 +107,9 @@ async function loadModel(modelName) {
 }
 
 // audio: Float32Array of 16kHz mono samples.
-async function transcribe(audio, samplingRate = 16000) {
+async function transcribe(audio, samplingRate = 16000, language = 'en') {
     if (!whisperWindow) throw new Error('Whisper window not initialized');
-    return send('whisper:transcribe', { audio, samplingRate }, TRANSCRIBE_TIMEOUT_MS);
+    return send('whisper:transcribe', { audio, samplingRate, language }, TRANSCRIBE_TIMEOUT_MS);
 }
 
 function destroy() {

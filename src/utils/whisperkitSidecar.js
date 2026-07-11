@@ -45,6 +45,7 @@ let cliPath = undefined; // undefined = not probed yet, null = not found
 let child = null;
 let serverReady = false;
 let servedModel = null; // WhisperKit model name loaded in the sidecar
+let servedLanguage = 'en'; // language the sidecar was started with
 let restartPromise = null;
 
 function findCli() {
@@ -88,10 +89,13 @@ function healthCheck() {
 
 // Spawn `whisperkit-cli serve` and wait until /health responds, which the
 // server only does after the model has finished downloading and loading.
-function startServer(wkModel) {
+function startServer(wkModel, language = 'en') {
     return new Promise((resolve, reject) => {
         const cli = findCli();
-        child = spawn(cli, ['serve', '--model', wkModel, '--port', String(PORT), '--host', HOST], {
+        // The per-request `language` form field is logged by the server but not
+        // applied to decoding, so without this flag Whisper auto-detects the
+        // language per utterance (random Icelandic/Urdu output on Hindi audio).
+        child = spawn(cli, ['serve', '--model', wkModel, '--language', language, '--port', String(PORT), '--host', HOST], {
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         const proc = child;
@@ -156,13 +160,13 @@ function encodeWav(float32Audio, sampleRate) {
     return buffer;
 }
 
-function postTranscription(wavBuffer) {
+function postTranscription(wavBuffer, language = 'en') {
     return new Promise((resolve, reject) => {
         const boundary = '----WhisperKitSidecar' + Math.random().toString(36).slice(2);
         const part = name => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n`;
         const body = Buffer.concat([
             Buffer.from(part('model') + servedModel + '\r\n'),
-            Buffer.from(part('language') + 'en' + '\r\n'),
+            Buffer.from(part('language') + language + '\r\n'),
             Buffer.from(
                 `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n` +
                     'Content-Type: audio/wav\r\n\r\n'
@@ -206,16 +210,17 @@ function postTranscription(wavBuffer) {
     });
 }
 
-async function loadModel(modelName) {
+async function loadModel(modelName, language = 'en') {
     const wkModel = MODEL_MAP[modelName];
     if (!wkModel) throw new Error(`No WhisperKit mapping for model ${modelName}`);
-    if (serverReady && servedModel === wkModel) return true;
-    // A sidecar serving a different model holds the port — replace it.
+    if (serverReady && servedModel === wkModel && servedLanguage === language) return true;
+    // A sidecar serving a different model or language holds the port — replace it.
     if (child) destroy();
 
     sendToRenderer('update-status', 'Loading Whisper model on Neural Engine (first time may take a while)...');
-    await startServer(wkModel);
+    await startServer(wkModel, language);
     servedModel = wkModel;
+    servedLanguage = language;
 
     // Same rationale as the CPU backend's warmup in transcriber.js: the first
     // inference pays one-time ANE graph compilation, so spend it on silence
@@ -232,7 +237,7 @@ async function loadModel(modelName) {
 }
 
 // audio: Float32Array of 16kHz mono samples.
-async function transcribe(float32Audio, samplingRate = 16000) {
+async function transcribe(float32Audio, samplingRate = 16000, language = 'en') {
     // If the sidecar crashed mid-session, respawn it once per outage instead of
     // failing every utterance until the session restarts. The model is cached
     // on disk, so recovery is seconds, not a re-download. transcriber.js
@@ -242,13 +247,13 @@ async function transcribe(float32Audio, samplingRate = 16000) {
         if (!servedModel) throw new Error('WhisperKit sidecar not initialized');
         if (!restartPromise) {
             console.warn('[WhisperKit] Sidecar not running — restarting...');
-            restartPromise = startServer(servedModel).finally(() => {
+            restartPromise = startServer(servedModel, servedLanguage).finally(() => {
                 restartPromise = null;
             });
         }
         await restartPromise;
     }
-    return postTranscription(encodeWav(float32Audio, samplingRate));
+    return postTranscription(encodeWav(float32Audio, samplingRate), language);
 }
 
 function destroy() {
