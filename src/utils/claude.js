@@ -34,7 +34,10 @@ let transcriptDebounceTimer = null;
 let lastSentTranscriptTurn = null; // text of the in-flight auto request, for recombination
 let inFlightIsSupersedable = false; // only flushPendingTranscripts-initiated requests
 let pendingFirstQueuedAt = 0; // when the oldest pending fragment arrived
-const MAX_FLUSH_HOLD_MS = 3000;
+// A finalized transcript dispatches immediately after the merge debounce —
+// never held back because the transcription pipeline looks busy. Speech that
+// arrives after dispatch supersedes the in-flight answer instead (see below),
+// which costs one cancelled request but keeps time-to-first-answer low.
 // During continuous speech a new transcript lands every few seconds — if each
 // one were allowed to abort the in-flight answer, no answer would ever finish
 // (the exact "listening but never answering" failure). Cap how many times one
@@ -65,6 +68,10 @@ function clearStalledInFlight() {
 // speech that was heard but not auto-answered (see answerWithContext).
 let recentHeardTranscripts = [];
 const RECENT_HEARD_MAX = 8;
+// The clean text of the most recent question that was actually answered. Answers
+// default to a short 3-5 line paragraph; expandLastAnswer() re-asks Claude for
+// the in-depth version of THIS question on demand (button / shortcut).
+let lastAnsweredQuestion = null;
 
 // The VAD already waits ~1s of end-of-utterance silence before a transcript is
 // produced, so this debounce only needs to catch transcripts split across that
@@ -73,17 +80,33 @@ const RECENT_HEARD_MAX = 8;
 const TRANSCRIPT_DEBOUNCE_MS = 100;
 const RESPONSE_UPDATE_INTERVAL_MS = 50;
 
-// Claude Code CLI state
-let cliPath = null; // resolved lazily on first subprocess use (image path)
+// Claude Code CLI state. The installed `claude` binary is the primary
+// transport for all text requests; the SDK is kept only as a one-shot
+// fallback (see sendClaudeText), because the bundled SDK version can lag the
+// installed CLI and its child process has been observed exiting with code 1
+// while the binary itself works.
+let cliPath = null; // resolved and validated once per app run
 let cliEnv = null;
-let cliSessionId = null; // session_id from SDK / --resume, keeps conversation context
-let activeCliProc = null; // subprocess handle (image path only)
-let activeCliAbort = null; // AbortController for in-flight SDK query (text path)
+let cliUnavailable = false; // no working binary found — go straight to the SDK
+let cliResolutionPromise = null; // de-dupes concurrent resolution attempts
+let cliSessionId = null; // session_id from --resume, keeps conversation context
+let activeCliProc = null; // in-flight CLI subprocess handle
+let activeCliAbort = null; // AbortController for the in-flight request (CLI or SDK)
 const CLI_TIMEOUT_MS = 120000;
 // Watchdog for SDK queries. A hung request would otherwise keep
 // isTranscriptResponseInFlight true forever and silently stop all answers.
 const QUERY_TIMEOUT_MS = 120000;
 const WARMUP_TIMEOUT_MS = 15000;
+// Session activation no longer waits for the Claude warm-up: audio starts as
+// soon as Whisper is ready, and transcripts queue behind this flag until the
+// transport has been prepared (or the warm-up gave up). The warm-up is
+// bounded by WARMUP_TIMEOUT_MS, so the wait always ends; the cap below is a
+// safety net so a lost ready signal can never hold a question forever.
+let isTransportReady = false;
+const TRANSPORT_WAIT_MAX_MS = 20000;
+// Incremented on every session init/close so background work from a previous
+// session (warm-up completion callbacks) can detect it is stale and do nothing.
+let sessionGeneration = 0;
 
 // Lazy-loaded @anthropic-ai/claude-code query function
 let _queryFn = null;
@@ -101,16 +124,21 @@ const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 **CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
 - NEVER ask the candidate clarifying questions or request more details. They are mid-interview and cannot relay your questions back to the interviewer — asking is useless and breaks the flow. This rule has NO exceptions.
 - When a question is open-ended or under-specified (e.g. "design a RAG system", "how would you build X", "design a rate limiter"), do NOT ask which language, database, framework, or scale to assume. State your assumptions in one short line (e.g. "Assuming Python + pgvector on Postgres:") and immediately give a complete, confident answer the candidate can speak. Choosing reasonable assumptions and defending them IS what "design X" questions are testing.
+- For system design questions specifically, do NOT try to hit every textbook criterion (requirements, estimation, HLD, DB, API, scaling, bottlenecks, failure handling, trade-offs) in one short answer — that reads as shallow, not thorough. Instead pick the 2-3 points the question is actually probing (infer from its wording — "scale to millions" means capacity/sharding, "financial data" means consistency/correctness) and go one level deeper on those, explicitly naming the trade-off/why. It is fine and expected to leave other angles unmentioned in the short answer.
 - Start with the direct answer. Do not add an introduction or restate the question.
-- For normal questions, respond in 1-3 short sentences and then stop.
-- Add bullets only when the user explicitly asks for steps, options, or a list.
-- For ordinary code questions, give the approach in one sentence followed by only the necessary code.
+- DEFAULT LENGTH: answer in a short paragraph of 3 to 5 lines (a line is one short sentence or one bullet). This is the quick answer the candidate speaks first — the user can separately ask for a detailed expansion, so keep this first answer tight and do NOT dump everything. Fewer than 3 lines reads as no answer mid-interview — never do it. Exceptions: code, and the demo/hands-on rule below.
+- Structure: line 1 is the direct answer or definition; the remaining lines give only the 2-3 most important points, techniques, or a concrete example an interviewer expects to hear.
+- Use short bullets when the answer naturally enumerates techniques, steps, or comparisons (they are faster to read aloud from); otherwise use short sentences.
+- For code questions, give the approach in one sentence followed by the necessary code (code does not count toward the line cap).
 - If asked to demonstrate, share a demo, implement live, or do hands-on coding, ignore the normal length limit. Give: (1) a one-line approach, (2) ordered implementation steps, (3) complete runnable code, and (4) exact commands to run or verify it.
 - During demos and hands-on coding, keep commentary minimal and prioritize executable instructions and code.
-- Do not add background, examples, caveats, summaries, or offers to help unless they are required for correctness. Never add follow-up or clarifying questions — there are no exceptions to this.
-- Never continue after the question has been fully answered.
-- The input is a live speech transcript that may contain mis-heard words, filler, or background chatter. Answer only the actual question or request; ignore acknowledgements, greetings, and small talk ("thanks", "okay", "got it", "bye").
-- If the transcript is not a genuine question or request, or is too garbled/out-of-context to answer confidently, reply with nothing rather than guessing or improvising an unrelated answer.
+- Within the 3-5 line budget, prefer substance (the single most useful technique or a concrete example) over caveats, summaries, or offers to help. Never add follow-up or clarifying questions — there are no exceptions to this.
+- Never continue past 5 lines once the question is answered (unless code is required or a detailed expansion was explicitly requested).
+- The input is a live speech transcript. An upstream filter has ALREADY removed pure filler and bare acknowledgements, so treat whatever reaches you as a genuine attempt to ask something and ALWAYS produce a substantive answer.
+- Speech-to-text frequently mangles technical terms and acronyms, especially with accented speech. FIRST reconstruct the most plausible intended words from the sound and the conversation context, THEN answer the intended question. Examples: "X? is a tag", "excess attack", or "six seasons" in a security context mean "XSS attack"; "front and" means "frontend"; "sea sharp" means "C#"; "no js" means "Node.js". Strip a leading wake-word or name ("Bane", "Claude", "hey"), collapse duplicated words, and drop hallucinated trailing fragments.
+- ALWAYS ANSWER — never reply with nothing. If the intended question is unclear even after reconstruction, pick the single most likely question from the topic anchors present, state it in one short line ("Assuming you're asking …:"), and answer it. A best-effort answer is always better than silence.
+- NO META-COMMENTARY about the transcript. Never say "too garbled", "I can't understand", "sounds like noise/background", "broken transcript", or otherwise describe or apologize for the input. Either answer directly, or state your one-line assumption and answer.
+- Worked example — input: "Bane, explain quickly, quickly, how a CDN Works, you know what I some disadvantage is advantage is of having a sitting on. I'm sure I love" → reconstruct to "Explain how a CDN works, plus the advantages and disadvantages of using one" (drop "Bane", the "quickly, quickly" repeat, and the "I'm sure I love" tail; "sitting on" ≈ CDN) → answer with the 3-7 line CDN explanation and its pros/cons. Do NOT respond that it is garbled.
 - Never respond with pleasantries such as "You're welcome", "No problem", or "Glad to help" — these are not answers.
 `;
 
@@ -123,10 +151,31 @@ const CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT = `
 - Start with the exact words to say. Do not add an introduction, restate what was heard, or explain your suggestion.
 - Respond in 1-3 short sentences and then stop.
 - If she asks a question, answer it directly in a natural conversational way.
-- If she shares a genuine statement, story, or feeling, suggest what to say back — an engaged response ending in a follow-up question or a fresh topic to keep the call going.
+- STAY ON THE CURRENT TOPIC. Use the conversation so far to know what you are already talking about, and keep your reply inside that thread. Respond to what she actually just said in the context of that topic — do NOT pivot to a new subject.
+- Treat incidental or logistical remarks in context, not as an invitation to change the subject. If you are mid-discussion about one thing and she drops a passing remark (e.g. "it's 7 o'clock", "one sec", "it's getting late"), acknowledge it briefly and return to the thread you were on — do not launch into a new line of questions about it.
+- Only introduce a new topic or a fresh follow-up question when the current thread has clearly and naturally closed (she wraps it up, changes the subject herself, or the exchange has reached a natural end). Never force a new direction just to "keep the call going" — a warm on-topic reply keeps it going better than a topic switch.
+- When she shares a genuine statement, story, or feeling, respond with interest within the current topic; end with a follow-up question ONLY if it deepens the thread you are already on.
 - Reply in the same language/mix as the transcript (Hinglish stays Hinglish, English stays English).
-- The input is a live speech transcript that may contain mis-heard words, filler, or background chatter. If the transcript is pure noise, too garbled to understand, or clearly background speech, reply with nothing rather than guessing.
+- The input is a live speech transcript that may contain mis-heard words. An upstream filter already removed pure filler, so reconstruct what she most likely said from the sound and the current topic, then always give a warm, on-thread reply. Never describe the input as garbled or unclear, and never reply with nothing — if a word is fuzzy, respond to the most likely meaning within the topic you are already on.
 `;
+
+// Whisper conditions its decoder on preceding text, so seeding it with domain
+// vocabulary steers ambiguous audio toward the terms actually being spoken —
+// this is what turns accented "XSS attack" into "XSS attack" instead of
+// "X? is a tag" or "six seasons". Passed to the WhisperKit sidecar as its
+// --prompt for technical profiles; conversational profiles skip it so casual
+// speech isn't dragged toward tech jargon. Keep it well under Whisper's
+// 224-token prompt window.
+const WHISPER_TECH_CONTEXT_PROMPT =
+    'Software engineering interview covering: XSS, CSRF, SQL injection, OAuth, JWT, REST API, GraphQL, frontend, backend, full-stack, ' +
+    'React, Node.js, TypeScript, Python, Kubernetes, Docker, CI/CD, microservices, caching, Redis, Kafka, rate limiting, load balancer, ' +
+    'system design, data structures, algorithms, Big O, hash map, binary tree, linked list, SQL, NoSQL, concurrency, mutex, deadlock.';
+
+// Profiles where the speaker is expected to use technical vocabulary; the
+// unknown/default profile maps to interview in prompts.js, so it counts too.
+function whisperContextPromptForProfile(profile) {
+    return !profile || profile === 'interview' || profile === 'exam' ? WHISPER_TECH_CONTEXT_PROMPT : '';
+}
 
 // Whisper hallucinates stock phrases on silence/noise (subtitle artifacts) and
 // the speaker emits acknowledgements ("thanks", "okay", "got it") that are not
@@ -140,6 +189,11 @@ const TRANSCRIPT_NOISE_PATTERNS = [
     /^bye(-?bye)?\.?$/,
     /^you'?re welcome\.?$/,
     /^(o?k(ay)?|alright|right|sure|yeah|yep|yes|no|nope|uh|um|hmm|mhm|cool|nice|great|got it|i see|of course|no problem)\.?$/,
+    // Conversational lead-ins ("Okay, so", "right, so", "well, um") — the
+    // speaker is winding up to say something, but nothing has been asked yet.
+    // These are short multi-word fragments, so the single-word gate below
+    // misses them. Genuine short questions end with "?" and never match.
+    /^(o?k(ay)?|alright|all right|right|so|well|now|anyway|and|but|then|yeah|you know|i mean|let'?s see)((,| )+(so|then|well|yeah|now|right|o?kay?|um+|uh+|anyway|you know|i mean))*[,.!…]*$/,
     /^\W*$/, // punctuation / symbols only
 ];
 
@@ -166,12 +220,12 @@ async function flushPendingTranscripts() {
         return;
     }
 
-    // The speaker is still mid-turn (VAD hears speech, or an utterance is being
-    // transcribed) — more text is imminent, so hold the flush and let it merge
-    // instead of answering half a question. Bounded so a noisy VAD can't
-    // starve answers forever.
-    if (transcriber.isPipelineBusy() && Date.now() - pendingFirstQueuedAt < MAX_FLUSH_HOLD_MS) {
-        transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+    // Claude transport still warming up — keep the transcript queued instead
+    // of racing the warm-up or dropping the user's first question. Bounded:
+    // the warm-up itself times out, and past the cap we just send anyway.
+    if (!isTransportReady && Date.now() - pendingFirstQueuedAt < TRANSPORT_WAIT_MAX_MS) {
+        sendToRenderer('update-status', 'Claude preparing — your question is queued...');
+        transcriptDebounceTimer = setTimeout(flushPendingTranscripts, 250);
         return;
     }
 
@@ -184,6 +238,9 @@ async function flushPendingTranscripts() {
         return;
     }
 
+    // Stage timing: how long the transcript waited between Whisper finishing
+    // and the Claude request being dispatched (debounce + any transport hold).
+    console.log(`[Claude] Dispatching transcript ${Date.now() - pendingFirstQueuedAt}ms after it was queued`);
     console.log('[Claude] Flushing transcript to Claude:', transcription.substring(0, 80));
     isTranscriptResponseInFlight = true;
     inFlightStartedAt = Date.now();
@@ -332,9 +389,51 @@ async function answerWithContext() {
         `If the speech truly carries no question, infer the most likely thing the user wants help with right now from the conversation and answer that.`;
 
     try {
-        const result = await sendClaudeText(prompt);
+        // Record the clean heard speech (not the big override prompt) as the
+        // question, so a later "expand" targets what was actually asked.
+        const result = await sendClaudeText(prompt, { recordAsQuestion: speech });
         recentHeardTranscripts = [];
         return result;
+    } finally {
+        isTranscriptResponseInFlight = false;
+        inFlightStartedAt = 0;
+        if (isClaudeActive && pendingTranscripts.length > 0) {
+            transcriptDebounceTimer = setTimeout(flushPendingTranscripts, TRANSCRIPT_DEBOUNCE_MS);
+        }
+    }
+}
+
+// Re-ask Claude for the full, detailed version of the last answered question.
+// Answers default to a short 3-5 line paragraph; this is the on-demand "show
+// details" action (button / shortcut). Reuses the CLI session so Claude sees
+// its own prior short answer and expands rather than repeats it.
+async function expandLastAnswer() {
+    if (!isClaudeActive) {
+        return { success: false, error: 'No active Claude session' };
+    }
+    if (isTranscriptResponseInFlight) {
+        return { success: false, error: 'Already responding' };
+    }
+    if (!lastAnsweredQuestion) {
+        sendToRenderer('update-status', 'Ask something first, then tap Details');
+        return { success: false, error: 'Nothing to expand yet' };
+    }
+
+    isTranscriptResponseInFlight = true;
+    inFlightStartedAt = Date.now();
+    inFlightIsSupersedable = false; // an explicit request must never be aborted by new speech
+    sendToRenderer('update-status', 'Expanding answer...');
+
+    const prompt =
+        `[DETAILED EXPANSION — IGNORE THE SHORT 3-5 LINE ANSWER LIMIT FOR THIS REPLY ONLY]\n` +
+        `The user wants the in-depth version of your previous answer to: "${lastAnsweredQuestion}".\n` +
+        `Go deep now: explain the key concepts, how it works step by step, the main trade-offs and edge cases, and give a concrete example or short code snippet where useful. ` +
+        `Use short headings or bullets so it stays easy to read aloud. Do not restate the question, and do not ask anything back.`;
+
+    try {
+        // recordAsQuestion:null — keep the original question so repeated
+        // expansions always target it, not this internal prompt.
+        return await sendClaudeText(prompt, { recordAsQuestion: null });
     } finally {
         isTranscriptResponseInFlight = false;
         inFlightStartedAt = 0;
@@ -389,20 +488,91 @@ async function resolveClaudeCli() {
     return null;
 }
 
+// Resolve and validate the CLI once, cache its path/env for every later
+// invocation, and remember a definitive miss so text requests can go straight
+// to the SDK instead of re-probing the filesystem per question.
+async function ensureCliResolved() {
+    if (cliPath) return { path: cliPath, env: cliEnv };
+    if (cliResolutionPromise) return cliResolutionPromise;
+    cliResolutionPromise = (async () => {
+        const startedAt = Date.now();
+        const cli = await resolveClaudeCli();
+        if (cli) {
+            cliPath = cli.path;
+            cliEnv = cli.env;
+            cliUnavailable = false;
+            console.log(`[Claude] CLI resolved in ${Date.now() - startedAt}ms`);
+        } else {
+            cliUnavailable = true;
+            console.warn(`[Claude] No working Claude CLI found (${Date.now() - startedAt}ms) — the SDK will handle requests`);
+        }
+        return cli;
+    })().finally(() => {
+        cliResolutionPromise = null;
+    });
+    return cliResolutionPromise;
+}
+
+// First meaningful stderr/error line, ANSI-stripped and bounded, so statuses
+// and logs show the actual CLI diagnostic without dumping a stack trace or
+// anything sensitive-looking into the UI. Never includes the prompt.
+function sanitizeDiagnostic(text) {
+    if (!text) return '';
+    const line =
+        String(text)
+            .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+            .split('\n')
+            .map(l => l.trim())
+            .find(Boolean) || '';
+    return line.length > 200 ? line.slice(0, 200) + '…' : line;
+}
+
+// Map a failed CLI invocation to a stable error string (for fallback logic)
+// and an actionable renderer status. Each failure class keeps a distinct
+// message instead of collapsing into a generic "no reply".
+function classifyCliFailure({ stderrText = '', message = '' } = {}) {
+    const haystack = `${stderrText}\n${message}`;
+    const diag = sanitizeDiagnostic(stderrText) || sanitizeDiagnostic(message);
+    if (/No conversation found with session ID/i.test(haystack)) {
+        return {
+            kind: 'resume',
+            error: 'No conversation found with session ID — resume failed',
+            status: 'Claude session expired — retrying with a fresh conversation',
+        };
+    }
+    if (/not logged in|log ?in|authenticate|unauthorized|401|invalid api key|oauth|credentials/i.test(haystack)) {
+        return {
+            kind: 'auth',
+            error: 'Claude CLI not logged in' + (diag ? ': ' + diag : ''),
+            status: 'Claude CLI not logged in — run "claude" in a terminal and sign in',
+        };
+    }
+    if (/invalid model|unknown model|not a valid model|model not (found|supported|available)/i.test(haystack)) {
+        return {
+            kind: 'model',
+            error: `Invalid Claude model: ${claudeModel}` + (diag ? ' — ' + diag : ''),
+            status: `Claude model "${claudeModel}" not available — pick another model in settings`,
+        };
+    }
+    const error = diag ? 'Claude CLI failed: ' + diag : 'Claude CLI failed';
+    return { kind: 'unknown', error, status: error };
+}
+
 // ── Claude Code CLI invocation ──
 
-async function runClaudeCli(prompt, { allowedTools } = {}) {
-    // The SDK path handles all text requests, so the CLI binary is only
-    // resolved here, on first subprocess use (image analysis).
-    if (!cliPath) {
-        const cli = await resolveClaudeCli();
-        if (!cli) {
-            sendToRenderer('update-status', 'Claude CLI not found — install Claude Code or switch to API key mode');
-            return { success: false, error: 'Claude CLI not found' };
-        }
-        cliPath = cli.path;
-        cliEnv = cli.env;
+// Primary transport for all Claude text requests (and image analysis via the
+// Read tool). quiet suppresses renderer/status events (warm-up); adoptSession
+// controls whether a successful run's session id becomes the conversation's
+// resume id — the warm-up must never donate its throwaway session.
+async function runClaudeCli(prompt, { allowedTools, quiet = false, timeoutMs = CLI_TIMEOUT_MS, adoptSession = true } = {}) {
+    const cli = await ensureCliResolved();
+    if (!cli) {
+        if (!quiet) sendToRenderer('update-status', 'Claude CLI not found — install Claude Code or switch to API key mode');
+        return { success: false, error: 'Claude CLI not found' };
     }
+
+    const requestStartedAt = Date.now();
+
     return new Promise(resolve => {
         const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', claudeModel];
         // Replace Claude Code's large coding-agent prompt. This app needs a
@@ -417,14 +587,13 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
             args.push('--allowedTools', allowedTools);
         }
 
-        console.log('[Claude] Spawning CLI', cliSessionId ? `(resume ${cliSessionId})` : '(new session)');
+        console.log('[Claude] Spawning CLI', cliSessionId ? '(resume session)' : '(new session)');
 
         let proc;
         try {
-            // Same cwd as the SDK path (runClaudeQuery). Claude Code stores
-            // conversations per project directory (keyed by cwd), so resuming
-            // a session created by the SDK from a different cwd fails with
-            // "No conversation found with session ID".
+            // Claude Code stores conversations per project directory (keyed by
+            // cwd), so every invocation must use the same cwd or --resume fails
+            // with "No conversation found with session ID".
             proc = spawn(cliPath, args, { env: cliEnv, stdio: ['ignore', 'pipe', 'pipe'], cwd: os.tmpdir() });
         } catch (error) {
             resolve({ success: false, error: 'Failed to start Claude CLI: ' + error.message });
@@ -432,6 +601,10 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
         }
 
         activeCliProc = proc;
+        // Supersede/close paths abort the in-flight request through this
+        // controller regardless of transport, so wire it to the subprocess.
+        const controller = new AbortController();
+        activeCliAbort = controller;
 
         let lineBuffer = '';
         let stderrText = '';
@@ -441,10 +614,16 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
         let finalText = '';
         let isFirst = true;
         let settled = false;
+        let firstOutputLogged = false;
+        let sawValidEvent = false; // any parseable stream-json line
+        let sawAnyStdout = false;
+        // Session ids are only committed after a confirmed successful run, so
+        // a failed/aborted invocation can never poison the next --resume.
+        let candidateSessionId = null;
 
         const emit = () => {
             fullText = committedText + (committedText && currentDelta ? '\n' : '') + currentDelta;
-            if (fullText) {
+            if (fullText && !quiet) {
                 sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
                 isFirst = false;
             }
@@ -455,19 +634,41 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
             settled = true;
             clearTimeout(timeout);
             if (activeCliProc === proc) activeCliProc = null;
+            if (activeCliAbort === controller) activeCliAbort = null;
+            if (result.success && adoptSession && candidateSessionId) {
+                cliSessionId = candidateSessionId;
+            }
             resolve(result);
         };
 
+        controller.signal.addEventListener('abort', () => {
+            try {
+                proc.kill('SIGTERM');
+            } catch (killError) {
+                // Process already exited
+            }
+            finish({ success: false, error: 'Cancelled' });
+        });
+
         const timeout = setTimeout(() => {
-            console.error('[Claude] CLI timed out, killing process');
-            proc.kill('SIGTERM');
-            sendToRenderer('update-status', 'Claude CLI timed out');
+            console.error(`[Claude] CLI timed out after ${timeoutMs}ms, killing process`);
+            try {
+                proc.kill('SIGTERM');
+            } catch (killError) {
+                // Process already exited
+            }
+            if (!quiet) sendToRenderer('update-status', 'Claude CLI timed out — listening again');
             finish({ success: false, error: 'Claude CLI timed out' });
-        }, CLI_TIMEOUT_MS);
+        }, timeoutMs);
 
         const handleEvent = event => {
+            sawValidEvent = true;
+            if (!firstOutputLogged) {
+                firstOutputLogged = true;
+                console.log(`[Claude] CLI first output in ${Date.now() - requestStartedAt}ms`);
+            }
             if (event.type === 'system' && event.subtype === 'init' && event.session_id) {
-                cliSessionId = event.session_id;
+                candidateSessionId = event.session_id;
             } else if (event.type === 'stream_event') {
                 // Token-level streaming from --include-partial-messages
                 const delta = event.event?.delta;
@@ -487,14 +688,15 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
                 currentDelta = '';
                 emit();
             } else if (event.type === 'result') {
-                if (event.session_id) cliSessionId = event.session_id;
+                if (event.session_id) candidateSessionId = event.session_id;
                 if (event.is_error || (event.subtype && event.subtype !== 'success')) {
-                    const message = event.result || 'Claude CLI error';
-                    sendToRenderer('update-status', 'Claude error: ' + message);
-                    finish({ success: false, error: message });
+                    const { error, status } = classifyCliFailure({ stderrText, message: event.result || 'Claude CLI error' });
+                    console.error('[Claude] CLI result error:', error);
+                    if (!quiet) sendToRenderer('update-status', status);
+                    finish({ success: false, error });
                 } else {
                     finalText = event.result || fullText;
-                    if (finalText && finalText !== fullText) {
+                    if (finalText && finalText !== fullText && !quiet) {
                         sendToRenderer(isFirst ? 'new-response' : 'update-response', finalText);
                         isFirst = false;
                     }
@@ -503,6 +705,7 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
         };
 
         proc.stdout.on('data', data => {
+            sawAnyStdout = true;
             lineBuffer += data.toString();
             const lines = lineBuffer.split('\n');
             lineBuffer = lines.pop(); // keep trailing partial line
@@ -523,30 +726,34 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
         proc.on('error', err => {
             console.error('[Claude] CLI spawn error:', err);
             const message = err.code === 'ENOENT' ? 'Claude CLI not found' : 'Claude CLI error: ' + err.message;
-            sendToRenderer('update-status', message);
+            if (!quiet) sendToRenderer('update-status', message);
             finish({ success: false, error: message });
         });
 
         proc.on('close', code => {
             if (settled) return;
+            const elapsed = Date.now() - requestStartedAt;
             if (code !== 0) {
-                console.error('[Claude] CLI exited with code', code, stderrText);
-                let message = 'Claude CLI failed';
-                if (/login|logged in|authenticate|unauthorized|api key/i.test(stderrText)) {
-                    message = 'Claude CLI not logged in — run "claude" in a terminal and sign in';
-                } else if (stderrText.trim()) {
-                    message = 'Claude CLI error: ' + stderrText.trim().split('\n')[0];
-                }
-                sendToRenderer('update-status', message);
-                finish({ success: false, error: message });
+                const { error, status } = classifyCliFailure({ stderrText });
+                console.error(`[Claude] CLI exited with code ${code} after ${elapsed}ms:`, sanitizeDiagnostic(stderrText) || '(no stderr)');
+                if (!quiet) sendToRenderer('update-status', status);
+                finish({ success: false, error });
                 return;
             }
             const text = finalText || fullText;
             if (!text) {
-                finish({ success: false, error: 'Claude CLI returned no response' });
+                if (sawAnyStdout && !sawValidEvent) {
+                    console.error(`[Claude] CLI produced no parseable stream events after ${elapsed}ms`);
+                    if (!quiet) sendToRenderer('update-status', 'Claude CLI returned malformed output');
+                    finish({ success: false, error: 'Claude CLI returned malformed output' });
+                } else {
+                    if (!quiet) sendToRenderer('update-status', 'Claude returned no response');
+                    finish({ success: false, error: 'Claude CLI returned no response' });
+                }
                 return;
             }
-            sendToRenderer('update-status', 'Listening...');
+            console.log(`[Claude] CLI response completed in ${elapsed}ms`);
+            if (!quiet) sendToRenderer('update-status', 'Listening...');
             finish({ success: true, text });
         });
     });
@@ -557,7 +764,8 @@ async function runClaudeCli(prompt, { allowedTools } = {}) {
 
 // quiet: suppress all renderer/status events. Used by the init warm-up so it
 // primes the agent runtime without flickering the UI or showing a response.
-async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT_MS } = {}) {
+// adoptSession: as in runClaudeCli — the warm-up's session id is throwaway.
+async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT_MS, adoptSession = true } = {}) {
     const requestStartedAt = Date.now();
     let firstTokenLogged = false;
     let query;
@@ -639,7 +847,7 @@ async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT
             if (controller.signal.aborted) break;
 
             if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
-                cliSessionId = msg.session_id;
+                if (adoptSession) cliSessionId = msg.session_id;
             } else if (msg.type === 'stream_event') {
                 const ev = msg.event;
                 if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
@@ -665,7 +873,7 @@ async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT
                 fullText = committed;
                 emitResponse(true);
             } else if (msg.type === 'result') {
-                if (msg.session_id) cliSessionId = msg.session_id;
+                if (msg.session_id && adoptSession) cliSessionId = msg.session_id;
                 if (msg.is_error || (msg.subtype && msg.subtype !== 'success')) {
                     const errMsg = msg.result || 'Claude error';
                     if (!quiet) sendToRenderer('update-status', 'Claude error: ' + errMsg);
@@ -708,28 +916,28 @@ async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT
     return { success: true, text: fullText };
 }
 
-// Pay the agent runtime's cold-start cost (module/agent init, auth handshake,
-// first-token warmup) during session setup instead of on the candidate's first
-// real question mid-interview. The throwaway session is discarded so the dummy
-// exchange never leaks into the real conversation, and a slow run here surfaces
-// the SDK→subprocess fallback in the logs before it can hurt a live answer.
+// Pay the transport's cold-start cost (binary resolution, auth handshake,
+// first-token warmup) in the background during session setup instead of on
+// the candidate's first real question mid-interview. Runs through the same
+// direct CLI path that real requests use, so a broken CLI surfaces here (in
+// logs and status) before it can hurt a live answer. adoptSession:false keeps
+// the throwaway warm-up exchange out of the real conversation.
 async function warmUpClaude() {
     if (claudeMode !== 'cli') return;
     const startedAt = Date.now();
     try {
-        // Short timeout: session activation awaits this, and while the session
-        // is inactive every transcript is silently dropped — a hung warm-up
-        // must never keep the app listening-but-mute for long.
-        const result = await runClaudeQuery('Reply with the single word: ready', { quiet: true, timeoutMs: WARMUP_TIMEOUT_MS });
+        const cli = await ensureCliResolved();
+        const options = { quiet: true, timeoutMs: WARMUP_TIMEOUT_MS, adoptSession: false };
+        const result = cli
+            ? await runClaudeCli('Reply with the single word: ready', options)
+            : await runClaudeQuery('Reply with the single word: ready', options);
         if (result.success) {
-            console.log(`[Claude] Warm-up completed in ${Date.now() - startedAt}ms`);
+            console.log(`[Claude] Warm-up completed in ${Date.now() - startedAt}ms via ${cli ? 'CLI' : 'SDK'}`);
         } else {
             console.warn('[Claude] Warm-up did not succeed (non-fatal):', result.error);
         }
     } catch (error) {
         console.warn('[Claude] Warm-up failed (non-fatal):', error.message);
-    } finally {
-        cliSessionId = null; // start the real conversation fresh, no warm-up turn
     }
 }
 
@@ -780,29 +988,40 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
     sendToRenderer('session-initializing', true);
 
+    const generation = ++sessionGeneration;
+    const initStartedAt = Date.now();
     try {
         claudeMode = mode === 'api' ? 'api' : 'cli';
         const realtimeRules = profile === 'relationship' ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT : CLAUDE_CONCISE_RESPONSE_PROMPT;
         currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + realtimeRules;
         claudeConversationHistory = [];
         cliSessionId = null;
+        isTransportReady = false;
 
         claudeModel = model || 'claude-haiku-4-5-20251001';
 
-        // Started during CLI setup and awaited just before the session goes
-        // active, so the agent cold-start overlaps the Whisper model load
-        // (the long pole) instead of adding to init wall-clock.
-        let warmUpPromise = null;
-
         if (claudeMode === 'cli') {
-            try {
-                await getQueryFn();
-                warmUpPromise = warmUpClaude();
-            } catch (error) {
-                sendToRenderer('session-initializing', false);
-                sendToRenderer('update-status', 'Claude SDK failed to load. Please ensure it is installed.');
-                return false;
-            }
+            // Resolve/validate the CLI and warm the transport entirely in the
+            // background. Session activation only waits for Whisper — a slow
+            // Claude cold-start must never keep the session listening-but-mute,
+            // and the first transcript queues behind isTransportReady instead
+            // of being dropped or racing the warm-up.
+            warmUpClaude()
+                .catch(error => {
+                    console.warn('[Claude] Warm-up failed (non-fatal):', error.message);
+                })
+                .finally(() => {
+                    if (generation !== sessionGeneration) return; // session closed/replaced meanwhile
+                    isTransportReady = true;
+                    console.log(`[Claude] Transport ready ${Date.now() - initStartedAt}ms after init start`);
+                    if (!isClaudeActive) return; // still initializing — activation sets the status
+                    if (pendingTranscripts.length > 0) {
+                        if (transcriptDebounceTimer) clearTimeout(transcriptDebounceTimer);
+                        transcriptDebounceTimer = setTimeout(flushPendingTranscripts, 0);
+                    } else if (!isTranscriptResponseInFlight) {
+                        sendToRenderer('update-status', 'Claude ready - Listening...');
+                    }
+                });
         } else {
             if (!anthropicApiKey || !anthropicApiKey.trim()) {
                 sendToRenderer('session-initializing', false);
@@ -811,14 +1030,17 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
             }
             const Anthropic = getAnthropic();
             anthropicClient = new Anthropic({ apiKey: anthropicApiKey.trim() });
+            isTransportReady = true; // direct API needs no warm-up
         }
 
         // Load Whisper for speech-to-text (audio → transcript → Claude)
-        const pipeline = await transcriber.initWhisper(whisperModel);
+        const whisperStartedAt = Date.now();
+        const pipeline = await transcriber.initWhisper(whisperModel, { contextPrompt: whisperContextPromptForProfile(profile) });
         if (!pipeline) {
             sendToRenderer('session-initializing', false);
             return false;
         }
+        console.log(`[Claude] Whisper ready in ${Date.now() - whisperStartedAt}ms`);
 
         transcriber.resetTranscriber();
         transcriber.setOnTranscript(transcription => {
@@ -827,16 +1049,14 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
         initializeNewSession(profile, customPrompt);
 
-        // Finish the cold-start warm-up before accepting audio so it can never
-        // race a real question (which would clobber the in-flight query/session).
-        if (warmUpPromise) await warmUpPromise;
-
+        // Go live now — the Claude warm-up keeps running in the background and
+        // any speech heard before it finishes queues until the transport is ready.
         isClaudeActive = true;
         isAudioMuted = false;
         sendToRenderer('session-initializing', false);
-        sendToRenderer('update-status', 'Claude ready - Listening...');
+        sendToRenderer('update-status', isTransportReady ? 'Claude ready - Listening...' : 'Listening... (Claude preparing)');
 
-        console.log('[Claude] Session initialized successfully in', claudeMode, 'mode');
+        console.log(`[Claude] Session initialized in ${claudeMode} mode in ${Date.now() - initStartedAt}ms (transport ready: ${isTransportReady})`);
         return true;
     } catch (error) {
         console.error('[Claude] Initialization error:', error);
@@ -900,7 +1120,10 @@ function retryWithFreshSession(result) {
     return true;
 }
 
-async function sendClaudeText(text) {
+// recordAsQuestion: the clean question text to remember for a later detailed
+// expansion (defaults to the sent text). Internal prompts that are not the
+// user's question — the expand prompt itself — pass null to keep the original.
+async function sendClaudeText(text, { recordAsQuestion = text } = {}) {
     if (!isClaudeActive) {
         return { success: false, error: 'No active Claude session' };
     }
@@ -913,14 +1136,31 @@ async function sendClaudeText(text) {
     console.log('[Claude] Sending text:', trimmed.substring(0, 100) + '...');
 
     if (claudeMode === 'cli') {
-        // Use the preloaded SDK path so setup is paid during initialization,
-        // while partial messages and the Claude login/session are preserved.
-        let result = await runClaudeQuery(trimmed);
-        if (retryWithFreshSession(result)) {
+        // The installed CLI is authoritative for text requests. On a lost
+        // resume session, retry once without --resume; on any other failure
+        // (startup, auth, malformed stream, timeout, empty response) fall back
+        // to the SDK exactly once. A supersede/close abort ('Cancelled') is
+        // intentional and must not trigger the fallback.
+        let result;
+        if (cliUnavailable) {
+            result = { success: false, error: 'Claude CLI not found' };
+        } else {
+            result = await runClaudeCli(trimmed);
+            if (retryWithFreshSession(result)) {
+                result = await runClaudeCli(trimmed);
+            }
+        }
+        if (!result.success && result.error !== 'Cancelled') {
+            console.warn(`[Claude] Direct CLI failed (${result.error}) — falling back to the SDK for this request`);
+            sendToRenderer('update-status', 'Claude CLI failed — retrying via SDK...');
             result = await runClaudeQuery(trimmed);
+            if (retryWithFreshSession(result)) {
+                result = await runClaudeQuery(trimmed);
+            }
         }
         if (result.success && result.text) {
             saveConversationTurn(trimmed, result.text);
+            if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
         sendToRenderer('response-complete'); // reveal the finished answer in the UI
         return result;
@@ -937,6 +1177,7 @@ async function sendClaudeText(text) {
         if (fullText.trim()) {
             claudeConversationHistory.push({ role: 'assistant', content: fullText.trim() });
             saveConversationTurn(trimmed, fullText);
+            if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
 
         console.log('[Claude] Response completed');
@@ -1027,7 +1268,9 @@ async function sendClaudeImage(base64Data, prompt) {
 
 function closeClaudeSession() {
     console.log('[Claude] Closing Claude session');
+    sessionGeneration++; // invalidate any in-flight warm-up completion callback
     isClaudeActive = false;
+    isTransportReady = false;
     isAudioMuted = false;
     if (transcriptDebounceTimer) {
         clearTimeout(transcriptDebounceTimer);
@@ -1035,6 +1278,7 @@ function closeClaudeSession() {
     }
     pendingTranscripts = [];
     recentHeardTranscripts = [];
+    lastAnsweredQuestion = null;
     isTranscriptResponseInFlight = false;
     lastSentTranscriptTurn = null;
     inFlightIsSupersedable = false;
@@ -1073,6 +1317,43 @@ module.exports = {
     sendClaudeText,
     sendClaudeImage,
     answerWithContext,
+    expandLastAnswer,
     closeClaudeSession,
     isClaudeSessionActive,
+};
+
+// Test seam. The transports cross process/SDK boundaries that unit tests must
+// stub (spawned CLI processes, the dynamically imported Claude Code SDK), and
+// the module keeps its state in closures — this gives tests a controlled way
+// in without touching production behavior.
+module.exports._testing = {
+    isMeaningfulTranscript,
+    runClaudeCli,
+    classifyCliFailure,
+    queueTranscript,
+    CLAUDE_CONCISE_RESPONSE_PROMPT,
+    CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT,
+    setQueryFnForTests(fn) {
+        _queryFn = fn;
+    },
+    setStateForTests({ active, transportReady, sessionId, mode, model } = {}) {
+        if (active !== undefined) isClaudeActive = active;
+        if (transportReady !== undefined) isTransportReady = transportReady;
+        if (sessionId !== undefined) cliSessionId = sessionId;
+        if (mode !== undefined) claudeMode = mode;
+        if (model !== undefined) claudeModel = model;
+    },
+    getStateForTests() {
+        return { cliSessionId, cliPath, cliUnavailable, isTransportReady, isTranscriptResponseInFlight, pendingCount: pendingTranscripts.length };
+    },
+    resetForTests() {
+        closeClaudeSession();
+        cliPath = null;
+        cliEnv = null;
+        cliUnavailable = false;
+        cliResolutionPromise = null;
+        isTransportReady = false;
+        claudeMode = 'cli';
+        _queryFn = null;
+    },
 };

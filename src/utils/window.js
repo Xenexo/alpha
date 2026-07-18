@@ -19,7 +19,7 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         height: windowHeight,
         minWidth: MIN_WINDOW_SIZE.width,
         minHeight: MIN_WINDOW_SIZE.height,
-        resizable: true,
+        resizable: false,
         frame: false,
         transparent: true,
         hasShadow: false,
@@ -113,6 +113,7 @@ function getDefaultKeybinds() {
         searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
         pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
         answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
+        expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
     };
 }
 
@@ -419,9 +420,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             if (globalShortcut.isRegistered(keybinds.pushToTalk)) {
                 console.log(`Registered pushToTalk: ${keybinds.pushToTalk}`);
             } else {
-                console.warn(
-                    `Could not register pushToTalk (${keybinds.pushToTalk}) — likely taken by another app. Rebind it in Customize.`
-                );
+                console.warn(`Could not register pushToTalk (${keybinds.pushToTalk}) — likely taken by another app. Rebind it in Customize.`);
                 sendToRenderer(
                     'update-status',
                     `Push-to-talk shortcut ${keybinds.pushToTalk} is unavailable (in use by another app) — rebind it in Customize.`
@@ -458,6 +457,31 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             }
         } catch (error) {
             console.error(`Failed to register answerWithContext (${keybinds.answerWithContext}):`, error);
+        }
+    }
+
+    // Register expand-answer shortcut: re-ask Claude for the detailed version of
+    // the last (short-by-default) answer.
+    if (keybinds.expandAnswer) {
+        try {
+            globalShortcut.register(keybinds.expandAnswer, () => {
+                console.log('Expand-answer shortcut triggered');
+                try {
+                    if (!mainWindow.isVisible()) {
+                        mainWindow.showInactive();
+                    }
+                    sendToRenderer('expand-answer-shortcut');
+                } catch (error) {
+                    console.error('Error handling expand-answer shortcut:', error);
+                }
+            });
+            if (globalShortcut.isRegistered(keybinds.expandAnswer)) {
+                console.log(`Registered expandAnswer: ${keybinds.expandAnswer}`);
+            } else {
+                console.warn(`Could not register expandAnswer (${keybinds.expandAnswer}) — likely taken by another app. Rebind it in Customize.`);
+            }
+        } catch (error) {
+            console.error(`Failed to register expandAnswer (${keybinds.expandAnswer}):`, error);
         }
     }
 

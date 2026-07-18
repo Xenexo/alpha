@@ -313,6 +313,7 @@ export class CustomizeView extends LitElement {
             searchSelection: isMac ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
             pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
             answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
+            expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
         };
     }
 
@@ -332,8 +333,22 @@ export class CustomizeView extends LitElement {
             { key: 'scrollDown', name: 'Scroll Response Down', description: 'Scroll response content downward' },
             { key: 'analyzeScreen', name: 'Analyze Screen Now', description: 'Capture screen and ask the AI immediately, from anywhere' },
             { key: 'searchSelection', name: 'Ask About Selected Text', description: 'Copy current selection in any app and send it to the AI' },
-            { key: 'pushToTalk', name: 'Ask by Voice (Push-to-talk)', description: 'Press to start listening to your mic, press again to send what you said as a question' },
-            { key: 'answerWithContext', name: 'Answer With Context', description: 'Make Claude answer the recently heard speech using the conversation context, even if it was not auto-answered (Claude only)' },
+            {
+                key: 'pushToTalk',
+                name: 'Ask by Voice (Push-to-talk)',
+                description: 'Press to start listening to your mic, press again to send what you said as a question',
+            },
+            {
+                key: 'answerWithContext',
+                name: 'Answer With Context',
+                description:
+                    'Make Claude answer the recently heard speech using the conversation context, even if it was not auto-answered (Claude only)',
+            },
+            {
+                key: 'expandAnswer',
+                name: 'Show Detailed Answer',
+                description: 'Re-ask Claude for the full, in-depth version of the last short answer (Claude only)',
+            },
         ];
     }
 
@@ -611,9 +626,13 @@ export class CustomizeView extends LitElement {
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
-                    ` : ''}
+                    ${
+                        this.audioMode !== 'speaker_only'
+                            ? html`
+                                  <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
+                              `
+                            : ''
+                    }
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>
@@ -693,20 +712,22 @@ export class CustomizeView extends LitElement {
         return html`
             <section class="surface">
                 <div class="surface-title">Keyboard Shortcuts</div>
-                ${this.getKeybindActions().map(action => html`
-                    <div class="keybind-row">
-                        <span class="keybind-name">${action.name}</span>
-                        <input
-                            type="text"
-                            class="control keybind-input"
-                            .value=${this.keybinds[action.key]}
-                            data-action=${action.key}
-                            @keydown=${this.handleKeybindInput}
-                            @focus=${this.handleKeybindFocus}
-                            readonly
-                        />
-                    </div>
-                `)}
+                ${this.getKeybindActions().map(
+                    action => html`
+                        <div class="keybind-row">
+                            <span class="keybind-name">${action.name}</span>
+                            <input
+                                type="text"
+                                class="control keybind-input"
+                                .value=${this.keybinds[action.key]}
+                                data-action=${action.key}
+                                @keydown=${this.handleKeybindInput}
+                                @focus=${this.handleKeybindFocus}
+                                readonly
+                            />
+                        </div>
+                    `
+                )}
                 <div style="margin-top: var(--space-sm);">
                     <button class="control" style="width:auto;padding:8px 10px;" @click=${this.resetKeybinds}>Reset to defaults</button>
                 </div>
@@ -726,9 +747,11 @@ export class CustomizeView extends LitElement {
                         ${this.isClearing ? 'Clearing...' : 'Delete all data'}
                     </button>
                 </div>
-                ${this.clearStatusMessage ? html`
-                    <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div>
-                ` : ''}
+                ${
+                    this.clearStatusMessage
+                        ? html` <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div> `
+                        : ''
+                }
             </section>
         `;
     }
@@ -738,10 +761,7 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()}
-                    ${this.renderLanguageSection()}
-                    ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
+                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

@@ -46,6 +46,7 @@ let child = null;
 let serverReady = false;
 let servedModel = null; // WhisperKit model name loaded in the sidecar
 let servedLanguage = 'en'; // language the sidecar was started with
+let servedPrompt = ''; // decoding-bias vocabulary the sidecar was started with
 let restartPromise = null;
 
 function findCli() {
@@ -57,14 +58,15 @@ function findCli() {
         '/usr/local/bin/whisperkit-cli',
         ...(process.env.PATH || '').split(':').map(dir => path.join(dir, 'whisperkit-cli')),
     ];
-    cliPath = candidates.find(p => {
-        try {
-            fs.accessSync(p, fs.constants.X_OK);
-            return true;
-        } catch {
-            return false;
-        }
-    }) || null;
+    cliPath =
+        candidates.find(p => {
+            try {
+                fs.accessSync(p, fs.constants.X_OK);
+                return true;
+            } catch {
+                return false;
+            }
+        }) || null;
     return cliPath;
 }
 
@@ -87,15 +89,24 @@ function healthCheck() {
     });
 }
 
+// Serve flags are fixed for the process lifetime (per-request form fields like
+// `language` are logged but not applied to decoding), so language and the
+// vocabulary-bias prompt must be baked in here; changing either requires a
+// sidecar restart (handled by loadModel).
+function buildServeArgs(wkModel, language, contextPrompt) {
+    const args = ['serve', '--model', wkModel, '--language', language, '--port', String(PORT), '--host', HOST];
+    // Whisper conditions its decoder on this text, biasing ambiguous audio
+    // toward domain terms ("XSS attack" instead of "X? is a tag").
+    if (contextPrompt) args.push('--prompt', contextPrompt);
+    return args;
+}
+
 // Spawn `whisperkit-cli serve` and wait until /health responds, which the
 // server only does after the model has finished downloading and loading.
-function startServer(wkModel, language = 'en') {
+function startServer(wkModel, language = 'en', contextPrompt = '') {
     return new Promise((resolve, reject) => {
         const cli = findCli();
-        // The per-request `language` form field is logged by the server but not
-        // applied to decoding, so without this flag Whisper auto-detects the
-        // language per utterance (random Icelandic/Urdu output on Hindi audio).
-        child = spawn(cli, ['serve', '--model', wkModel, '--language', language, '--port', String(PORT), '--host', HOST], {
+        child = spawn(cli, buildServeArgs(wkModel, language, contextPrompt), {
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         const proc = child;
@@ -167,10 +178,7 @@ function postTranscription(wavBuffer, language = 'en') {
         const body = Buffer.concat([
             Buffer.from(part('model') + servedModel + '\r\n'),
             Buffer.from(part('language') + language + '\r\n'),
-            Buffer.from(
-                `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n` +
-                    'Content-Type: audio/wav\r\n\r\n'
-            ),
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n` + 'Content-Type: audio/wav\r\n\r\n'),
             wavBuffer,
             Buffer.from(`\r\n--${boundary}--\r\n`),
         ]);
@@ -210,17 +218,19 @@ function postTranscription(wavBuffer, language = 'en') {
     });
 }
 
-async function loadModel(modelName, language = 'en') {
+async function loadModel(modelName, language = 'en', contextPrompt = '') {
     const wkModel = MODEL_MAP[modelName];
     if (!wkModel) throw new Error(`No WhisperKit mapping for model ${modelName}`);
-    if (serverReady && servedModel === wkModel && servedLanguage === language) return true;
-    // A sidecar serving a different model or language holds the port — replace it.
+    if (serverReady && servedModel === wkModel && servedLanguage === language && servedPrompt === contextPrompt) return true;
+    // A sidecar serving a different model, language, or bias prompt holds the
+    // port — replace it (the model is disk-cached, so this is a quick reload).
     if (child) destroy();
 
     sendToRenderer('update-status', 'Loading Whisper model on Neural Engine (first time may take a while)...');
-    await startServer(wkModel, language);
+    await startServer(wkModel, language, contextPrompt);
     servedModel = wkModel;
     servedLanguage = language;
+    servedPrompt = contextPrompt;
 
     // Same rationale as the CPU backend's warmup in transcriber.js: the first
     // inference pays one-time ANE graph compilation, so spend it on silence
@@ -247,7 +257,7 @@ async function transcribe(float32Audio, samplingRate = 16000, language = 'en') {
         if (!servedModel) throw new Error('WhisperKit sidecar not initialized');
         if (!restartPromise) {
             console.warn('[WhisperKit] Sidecar not running — restarting...');
-            restartPromise = startServer(servedModel, servedLanguage).finally(() => {
+            restartPromise = startServer(servedModel, servedLanguage, servedPrompt).finally(() => {
                 restartPromise = null;
             });
         }
@@ -266,3 +276,7 @@ function destroy() {
 }
 
 module.exports = { isAvailable, loadModel, transcribe, destroy };
+
+// Test seam: exposes the pure arg builder so tests can verify the serve
+// invocation without spawning a real sidecar.
+module.exports._testing = { buildServeArgs };

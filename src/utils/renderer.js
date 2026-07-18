@@ -901,6 +901,30 @@ ipcRenderer.on('answer-with-context-shortcut', async () => {
     }
 });
 
+// Re-ask Claude for the detailed version of the last (short) answer. Triggered
+// by the global shortcut or the "Details" button in the assistant view.
+async function expandAnswer() {
+    if (!mediaStream) {
+        cheatingDaddy.setStatus('Start a session first');
+        return;
+    }
+    if (cheatingDaddy.getCurrentView() !== 'assistant' && cheatingDaddy.element()) {
+        cheatingDaddy.element().currentView = 'assistant';
+    }
+    try {
+        const result = await ipcRenderer.invoke('expand-answer');
+        if (result && !result.success && result.error) {
+            cheatingDaddy.setStatus(result.error);
+        }
+    } catch (error) {
+        console.error('Error invoking expand-answer:', error);
+    }
+}
+
+ipcRenderer.on('expand-answer-shortcut', () => {
+    expandAnswer();
+});
+
 // Selected text captured by the global shortcut (main process simulates copy)
 ipcRenderer.on('selection-captured', async (event, text) => {
     console.log('Selection captured:', text.substring(0, 100));
@@ -1222,6 +1246,7 @@ const cheatingDaddy = {
     sendTextMessage,
     handleShortcut,
     togglePushToTalk,
+    expandAnswer,
 
     // Storage API
     storage,

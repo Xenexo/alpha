@@ -601,6 +601,10 @@ export class MainView extends LitElement {
             const { ipcRenderer } = window.require('electron');
             this._whisperBackendInfo = await ipcRenderer.invoke('whisper-backend-info').catch(() => null);
 
+            // Populate the model dropdown from the live catalog for whichever
+            // mode is active (CLI login or API key), so newer models appear.
+            this._refreshClaudeModels();
+
             this.requestUpdate();
         } catch (e) {
             console.error('Error loading MainView storage:', e);
@@ -801,12 +805,21 @@ export class MainView extends LitElement {
         this._claudeMode = val;
         this._keyError = false;
         await cheatingDaddy.storage.updatePreference('claudeMode', val);
-        if (val === 'api') this._scheduleFetchClaudeModels(this._anthropicKey);
-        else {
-            this._claudeModels = null;
-            this._claudeModelsLoading = false;
-        }
+        this._refreshClaudeModels();
         this.requestUpdate();
+    }
+
+    // Fetch the model list for the active mode. API mode needs a key (debounced
+    // as the user types); CLI mode uses the installed Claude login directly.
+    _refreshClaudeModels() {
+        if (this._claudeMode === 'api') {
+            this._scheduleFetchClaudeModels(this._anthropicKey);
+        } else {
+            clearTimeout(this._modelFetchTimer);
+            this._claudeModelsLoading = true;
+            this.requestUpdate();
+            this._fetchClaudeModels(null);
+        }
     }
 
     async _saveClaudeModel(val) {
@@ -1021,17 +1034,16 @@ export class MainView extends LitElement {
                     <option value="Xenova/whisper-tiny" ?selected=${this._whisperModel === 'Xenova/whisper-tiny'}>
                         Tiny (recommended for speed)
                     </option>
-                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>Base (more accurate, slower)</option>
+                    <option value="Xenova/whisper-base" ?selected=${this._whisperModel === 'Xenova/whisper-base'}>
+                        Base (more accurate, slower)
+                    </option>
                     <option value="Xenova/whisper-small" ?selected=${this._whisperModel === 'Xenova/whisper-small'}>
                         Small (unstable — crashes on some Macs)
                     </option>
                     <option value="Xenova/whisper-medium" ?selected=${this._whisperModel === 'Xenova/whisper-medium'}>
                         Medium (unstable — crashes on some Macs)
                     </option>
-                    <option
-                        value="onnx-community/whisper-large-v3-turbo"
-                        ?selected=${this._whisperModel === 'onnx-community/whisper-large-v3-turbo'}
-                    >
+                    <option value="onnx-community/whisper-large-v3-turbo" ?selected=${this._whisperModel === 'onnx-community/whisper-large-v3-turbo'}>
                         Large v3 Turbo (most accurate, large download)
                     </option>
                 </select>
@@ -1089,39 +1101,41 @@ export class MainView extends LitElement {
                 </div>
             </div>
 
-            ${this._claudeMode === 'api'
-                ? html`
-                      <div class="form-group">
-                          <label class="form-label">Anthropic API Key</label>
-                          <input
-                              type="password"
-                              placeholder="Required"
-                              .value=${this._anthropicKey}
-                              @input=${e => this._saveAnthropicKey(e.target.value)}
-                              class=${this._keyError ? 'error' : ''}
-                          />
-                          <div class="form-hint">
-                              <span class="link" @click=${() => this.onExternalLink('https://console.anthropic.com/settings/keys')}
-                                  >Get Anthropic key</span
-                              >
+            ${
+                this._claudeMode === 'api'
+                    ? html`
+                          <div class="form-group">
+                              <label class="form-label">Anthropic API Key</label>
+                              <input
+                                  type="password"
+                                  placeholder="Required"
+                                  .value=${this._anthropicKey}
+                                  @input=${e => this._saveAnthropicKey(e.target.value)}
+                                  class=${this._keyError ? 'error' : ''}
+                              />
+                              <div class="form-hint">
+                                  <span class="link" @click=${() => this.onExternalLink('https://console.anthropic.com/settings/keys')}
+                                      >Get Anthropic key</span
+                                  >
+                              </div>
                           </div>
-                      </div>
-                  `
-                : html`
-                      <div class="form-hint">
-                          Uses the locally installed
-                          <code
-                              style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
-                              >claude</code
-                          >
-                          CLI with your existing claude.ai login. Install Claude Code and run
-                          <code
-                              style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
-                              >claude</code
-                          >
-                          once in a terminal to sign in.
-                      </div>
-                  `}
+                      `
+                    : html`
+                          <div class="form-hint">
+                              Uses the locally installed
+                              <code
+                                  style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
+                                  >claude</code
+                              >
+                              CLI with your existing claude.ai login. Install Claude Code and run
+                              <code
+                                  style="font-family: var(--font-mono); font-size: 11px; background: var(--bg-elevated); padding: 1px 4px; border-radius: 3px;"
+                                  >claude</code
+                              >
+                              once in a terminal to sign in.
+                          </div>
+                      `
+            }
 
             <div class="form-group">
                 <label class="form-label"
@@ -1142,9 +1156,13 @@ export class MainView extends LitElement {
     }
 
     _renderClaudeModelOptions() {
+        // Shown only until the live catalog (list-claude-models) loads or if it
+        // fails — full ids so they work in both CLI (accepts full names) and
+        // API mode. Kept current so Fable/Sonnet 5 appear even offline.
         const fallback = [
+            { id: 'claude-fable-5', name: 'Fable 5' },
+            { id: 'claude-sonnet-5', name: 'Sonnet 5' },
             { id: 'claude-opus-4-8', name: 'Opus 4.8 (most capable)' },
-            { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6 (fast + smart)' },
             { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5 (fastest)' },
         ];
         const models = this._claudeModels && this._claudeModels.length ? this._claudeModels : fallback;
@@ -1210,29 +1228,35 @@ export class MainView extends LitElement {
 
         return html`
             <div class="form-wrapper">
-                ${this._mode === 'local'
-                    ? html`
-                          <div class="title-row">
-                              <div class="page-title">alpha <span class="mode-suffix">Local AI</span></div>
-                              <button
-                                  class="help-btn"
-                                  @click=${() => {
+                ${
+                    this._mode === 'local'
+                        ? html`
+                              <div class="title-row">
+                                  <div class="page-title">alpha <span class="mode-suffix">Local AI</span></div>
+                                  <button
+                                      class="help-btn"
+                                      @click=${() => {
                                       this._showLocalHelp = !this._showLocalHelp;
                                   }}
-                              >
-                                  ${this._showLocalHelp ? closeIcon : helpIcon}
-                              </button>
-                          </div>
-                      `
-                    : html`
-                          <div class="page-title">${html`alpha <span class="mode-suffix">${this._mode === 'claude' ? 'Claude' : 'BYOK'}</span>`}</div>
-                      `}
+                                  >
+                                      ${this._showLocalHelp ? closeIcon : helpIcon}
+                                  </button>
+                              </div>
+                          `
+                        : html`
+                              <div class="page-title">
+                                  ${html`alpha <span class="mode-suffix">${this._mode === 'claude' ? 'Claude' : 'BYOK'}</span>`}
+                              </div>
+                          `
+                }
                 <div class="page-subtitle">
-                    ${this._mode === 'byok'
-                        ? 'Bring your own API keys'
-                        : this._mode === 'claude'
-                          ? 'Powered by Claude — via Claude Code or API key'
-                          : 'Run models locally on your machine'}
+                    ${
+                        this._mode === 'byok'
+                            ? 'Bring your own API keys'
+                            : this._mode === 'claude'
+                              ? 'Powered by Claude — via Claude Code or API key'
+                              : 'Run models locally on your machine'
+                    }
                 </div>
 
                 <!-- Cloud mode render branch intentionally disabled. -->

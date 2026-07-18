@@ -9,7 +9,9 @@ const storage = require('../storage');
 
 let whisperPipeline = null; // CPU-backend pipeline (only set when backend==='cpu')
 let backend = null; // 'ane' | 'webgpu' | 'cpu' — null until a model is loaded
+let loadedModelName = null; // for error messages and WebGPU worker recovery
 let whisperLanguage = 'en'; // 'en' | 'hi' — from the whisperLanguage preference, read at init
+let whisperContextPrompt = ''; // domain vocabulary to bias decoding (ANE backend), from initWhisper
 let isWhisperLoading = false;
 let onTranscript = null;
 let isTranscribing = false;
@@ -62,13 +64,14 @@ const VAD_MODES = {
     LOW_BITRATE: { energyThreshold: 0.008, speechFramesRequired: 4, silenceFramesRequired: 35 },
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
     VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 3 },
-    // Each VAD frame is ~0.1s. A ~1.0s end-of-utterance silence lets a full
-    // sentence accumulate before transcription instead of being chopped into
-    // short fragments — Whisper (especially the tiny model) is far more
-    // accurate with complete-utterance context. Interviewers routinely pause
-    // 0.5-1.0s mid-sentence, so 15 frames keeps partial phrases out of the
-    // transcript queue without adding perceptible latency to genuine turn-ends.
-    BALANCED: { energyThreshold: 0.007, speechFramesRequired: 2, silenceFramesRequired: 3 },
+    // Each VAD frame is ~0.1s. A ~0.5s end-of-utterance silence balances
+    // dispatch latency against fragmentation: short enough that an answer
+    // starts promptly after a natural pause, long enough that ordinary
+    // mid-sentence breaths don't chop the question. A question split across a
+    // longer pause still merges downstream (100ms flush debounce), and if an
+    // answer already started, the supersede path cancels and resends the
+    // combined transcript — so a too-early turn-end costs little.
+    BALANCED: { energyThreshold: 0.007, speechFramesRequired: 2, silenceFramesRequired: 5 },
 };
 let vadConfig = VAD_MODES.BALANCED;
 
@@ -252,7 +255,19 @@ function loadedHandle() {
 }
 
 async function loadWhisperPipeline(modelName) {
-    if (backend) return loadedHandle();
+    if (backend) {
+        // The pipeline outlives sessions, but the ANE sidecar's language and
+        // vocabulary prompt are fixed at server start — reconcile them for the
+        // new session (no-op when unchanged, quick restart when they differ).
+        if (backend === 'ane' && whisperkitSidecar.isAvailable()) {
+            try {
+                await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
+            } catch (error) {
+                console.warn('[Transcriber] ANE sidecar reconcile failed (keeping existing pipeline):', error.message);
+            }
+        }
+        return loadedHandle();
+    }
     if (isWhisperLoading) return null;
 
     isWhisperLoading = true;
@@ -266,31 +281,35 @@ async function loadWhisperPipeline(modelName) {
     try {
         if (whisperkitSidecar.isAvailable()) {
             console.log('[Transcriber] Loading Whisper on the Neural Engine (WhisperKit):', modelName);
-            await whisperkitSidecar.loadModel(modelName, whisperLanguage);
+            const aneStartedAt = Date.now();
+            await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
             backend = 'ane';
-            console.log('[Transcriber] Whisper model loaded on the Neural Engine');
+            loadedModelName = modelName;
+            console.log(`[Transcriber] Whisper model loaded on the Neural Engine in ${Date.now() - aneStartedAt}ms`);
             sendToRenderer('whisper-downloading', false);
             isWhisperLoading = false;
             return loadedHandle();
         }
         console.log('[Transcriber] WhisperKit sidecar unavailable — trying WebGPU');
     } catch (error) {
-        console.error('[Transcriber] WhisperKit load failed — falling back to WebGPU:', error);
+        console.error(`[Transcriber] WhisperKit load failed for "${modelName}" — falling back to WebGPU:`, error);
     }
 
     try {
         if (await whisperWindow.isWebGPUAvailable()) {
             console.log('[Transcriber] Loading Whisper on WebGPU:', modelName);
+            const webgpuStartedAt = Date.now();
             await whisperWindow.loadModel(modelName);
             backend = 'webgpu';
-            console.log('[Transcriber] Whisper model loaded on WebGPU');
+            loadedModelName = modelName;
+            console.log(`[Transcriber] Whisper model loaded on WebGPU in ${Date.now() - webgpuStartedAt}ms`);
             sendToRenderer('whisper-downloading', false);
             isWhisperLoading = false;
             return loadedHandle();
         }
         console.warn('[Transcriber] WebGPU unavailable — falling back to CPU');
     } catch (error) {
-        console.error('[Transcriber] WebGPU load failed — falling back to CPU:', error);
+        console.error(`[Transcriber] WebGPU load failed for "${modelName}" — falling back to CPU:`, error);
     }
 
     try {
@@ -300,11 +319,12 @@ async function loadWhisperPipeline(modelName) {
         const { app } = require('electron');
         const path = require('path');
         env.cacheDir = path.join(app.getPath('userData'), 'whisper-models');
+        const cpuStartedAt = Date.now();
         whisperPipeline = await pipeline('automatic-speech-recognition', modelName, {
             device: 'cpu',
             dtype: getDtypeForModel(modelName),
         });
-        console.log('[Transcriber] Whisper model loaded successfully');
+        console.log(`[Transcriber] Whisper model loaded on CPU in ${Date.now() - cpuStartedAt}ms`);
 
         // Warm up the ONNX graph with a throwaway inference. The first real
         // inference otherwise pays one-time kernel/graph allocation, making the
@@ -319,13 +339,14 @@ async function loadWhisperPipeline(modelName) {
         }
 
         backend = 'cpu';
+        loadedModelName = modelName;
         sendToRenderer('whisper-downloading', false);
         isWhisperLoading = false;
         return whisperPipeline;
     } catch (error) {
-        console.error('[Transcriber] Failed to load Whisper model:', error);
+        console.error(`[Transcriber] Failed to load Whisper model "${modelName}":`, error);
         sendToRenderer('whisper-downloading', false);
-        sendToRenderer('update-status', 'Failed to load Whisper model: ' + error.message);
+        sendToRenderer('update-status', `Failed to load Whisper model "${modelName}": ` + error.message);
         isWhisperLoading = false;
         return null;
     }
@@ -404,7 +425,17 @@ async function transcribeAudio(pcm16kBuffer) {
             text = await whisperkitSidecar.transcribe(float32Audio, 16000, whisperLanguage);
         } else if (backend === 'webgpu') {
             // Inference runs on the Apple GPU in the hidden Whisper window.
-            text = await whisperWindow.transcribe(float32Audio, 16000, whisperLanguage);
+            try {
+                text = await whisperWindow.transcribe(float32Audio, 16000, whisperLanguage);
+            } catch (webgpuError) {
+                // The hidden window may have crashed and been torn down; the
+                // model files are cached, so recreate the worker once and
+                // retry rather than failing every transcription until restart.
+                if (whisperWindow.isAlive()) throw webgpuError;
+                console.warn('[Transcriber] WebGPU worker gone — recreating once:', webgpuError.message);
+                await whisperWindow.loadModel(loadedModelName);
+                text = await whisperWindow.transcribe(float32Audio, 16000, whisperLanguage);
+            }
         } else {
             // Whisper expects audio at 16kHz which is what we have
             const result = await whisperPipeline(float32Audio, {
@@ -422,7 +453,7 @@ async function transcribeAudio(pcm16kBuffer) {
         console.log(`[Transcriber] Completed in ${Date.now() - startedAt}ms (${backend}):`, text);
         return text;
     } catch (error) {
-        console.error('[Transcriber] Transcription error:', error);
+        console.error(`[Transcriber] Transcription error (backend: ${backend}, model: ${loadedModelName}):`, error);
         return null;
     }
 }
@@ -486,13 +517,14 @@ async function drainTranscriptionQueue() {
 
 // ── Public API ──
 
-async function initWhisper(modelName) {
+async function initWhisper(modelName, { contextPrompt = '' } = {}) {
     try {
         whisperLanguage = storage.getPreferences().whisperLanguage || 'en';
     } catch (error) {
         console.warn('[Transcriber] Could not read whisperLanguage preference, defaulting to en:', error.message);
         whisperLanguage = 'en';
     }
+    whisperContextPrompt = contextPrompt;
     return await loadWhisperPipeline(modelName);
 }
 

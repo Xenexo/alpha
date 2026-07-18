@@ -124,7 +124,9 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             justify-content: center;
-            transition: color var(--transition), background var(--transition);
+            transition:
+                color var(--transition),
+                background var(--transition);
         }
 
         .nav-btn:hover:not(:disabled) {
@@ -201,12 +203,21 @@ export class AssistantView extends LitElement {
             animation: gen-pulse 1.2s ease-in-out infinite;
         }
 
-        .generating .dot:nth-child(2) { animation-delay: 0.2s; }
-        .generating .dot:nth-child(3) { animation-delay: 0.4s; }
+        .generating .dot:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        .generating .dot:nth-child(3) {
+            animation-delay: 0.4s;
+        }
 
         @keyframes gen-pulse {
-            0%, 100% { opacity: 0.25; }
-            50% { opacity: 1; }
+            0%,
+            100% {
+                opacity: 0.25;
+            }
+            50% {
+                opacity: 1;
+            }
         }
 
         /* ── Markdown ── */
@@ -224,12 +235,22 @@ export class AssistantView extends LitElement {
             letter-spacing: var(--tracking-tight);
         }
 
-        .response-container h1 { font-size: 1.5em; }
-        .response-container h2 { font-size: 1.3em; }
-        .response-container h3 { font-size: 1.15em; }
-        .response-container h4 { font-size: 1.05em; }
+        .response-container h1 {
+            font-size: 1.5em;
+        }
+        .response-container h2 {
+            font-size: 1.3em;
+        }
+        .response-container h3 {
+            font-size: 1.15em;
+        }
+        .response-container h4 {
+            font-size: 1.05em;
+        }
         .response-container h5,
-        .response-container h6 { font-size: 1em; }
+        .response-container h6 {
+            font-size: 1em;
+        }
 
         .response-container p {
             margin: 0.6em 0;
@@ -404,7 +425,9 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             color: var(--text-muted);
-            transition: transform var(--transition), color var(--transition);
+            transition:
+                transform var(--transition),
+                color var(--transition);
         }
 
         .transcript-row:hover .transcript-toggle {
@@ -469,7 +492,9 @@ export class AssistantView extends LitElement {
             border-radius: 100px;
             padding: 0 var(--space-md);
             height: 32px;
-            transition: border-color var(--transition), box-shadow var(--transition);
+            transition:
+                border-color var(--transition),
+                box-shadow var(--transition);
         }
 
         .input-bar-inner:focus-within {
@@ -510,9 +535,41 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             gap: 4px;
-            transition: border-color 0.4s ease, background var(--transition);
+            transition:
+                border-color 0.4s ease,
+                background var(--transition);
             flex-shrink: 0;
             overflow: hidden;
+        }
+
+        .details-btn {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            white-space: nowrap;
+            padding: var(--space-xs) var(--space-md);
+            border-radius: 100px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            transition:
+                border-color 0.4s ease,
+                background var(--transition);
+            flex-shrink: 0;
+        }
+
+        .details-btn:hover:not(:disabled) {
+            border-color: var(--accent);
+            background: var(--bg-surface);
+        }
+
+        .details-btn:disabled {
+            opacity: 0.4;
+            cursor: default;
         }
 
         .analyze-btn:hover:not(.analyzing) {
@@ -562,7 +619,10 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             gap: 4px;
-            transition: border-color var(--transition), background var(--transition), color var(--transition);
+            transition:
+                border-color var(--transition),
+                background var(--transition),
+                color var(--transition);
             flex-shrink: 0;
         }
 
@@ -582,8 +642,13 @@ export class AssistantView extends LitElement {
         }
 
         @keyframes talk-pulse {
-            0%, 100% { opacity: 0.4; }
-            50% { opacity: 1; }
+            0%,
+            100% {
+                opacity: 0.4;
+            }
+            50% {
+                opacity: 1;
+            }
         }
     `;
 
@@ -806,7 +871,7 @@ export class AssistantView extends LitElement {
         const perimeter = 2 * straightLen + 2 * arcLen;
 
         // Given a distance along the perimeter, return {x, y, nx, ny} (position + inward normal)
-        const pointOnPerimeter = (d) => {
+        const pointOnPerimeter = d => {
             d = ((d % perimeter) + perimeter) % perimeter;
             // Top straight: left to right
             if (d < straightLen) {
@@ -845,7 +910,7 @@ export class AssistantView extends LitElement {
             seeds.push({ pos: Math.random(), drift: Math.random(), depthSeed: Math.random() });
         }
 
-        const draw = (now) => {
+        const draw = now => {
             const elapsed = (now - startTime) / 1000;
             const fade = Math.min(1, elapsed / FADE_IN);
 
@@ -937,11 +1002,7 @@ export class AssistantView extends LitElement {
             this.updateResponseContent();
         }
 
-        if (
-            changedProperties.has('transcripts') ||
-            changedProperties.has('interimTranscript') ||
-            changedProperties.has('transcriptsExpanded')
-        ) {
+        if (changedProperties.has('transcripts') || changedProperties.has('interimTranscript') || changedProperties.has('transcriptsExpanded')) {
             const history = this.shadowRoot.querySelector('#transcriptHistory');
             if (history) history.scrollTop = history.scrollHeight;
         }
@@ -984,7 +1045,8 @@ export class AssistantView extends LitElement {
         const currentResponse = this.getCurrentResponse();
         const isLatest = this.currentResponseIndex === this.responses.length - 1;
         if (this.isStreaming && isLatest && !currentResponse) {
-            container.innerHTML = '<div class="generating">Generating response<span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';
+            container.innerHTML =
+                '<div class="generating">Generating response<span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';
             return;
         }
 
@@ -1012,94 +1074,197 @@ export class AssistantView extends LitElement {
             <div class="answer-area">
                 <div class="response-container" id="responseContainer"></div>
 
-                ${hasMultipleResponses ? html`
-                    <div class="float-nav ${!isOnLatest ? 'not-latest' : ''}">
-                        <button class="nav-btn" @click=${this.navigateToPreviousResponse} ?disabled=${this.currentResponseIndex <= 0} title="Previous response">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                                <path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
-                            </svg>
-                        </button>
-                        <span class="response-counter">${this.currentResponseIndex + 1}/${this.responses.length}</span>
-                        <button class="nav-btn" @click=${this.navigateToNextResponse} ?disabled=${this.currentResponseIndex >= this.responses.length - 1} title="Next response">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                                <path fill-rule="evenodd" d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-                            </svg>
-                        </button>
-                        ${!isOnLatest ? html`
-                            <button class="latest-btn" @click=${this.navigateToLatestResponse} title="Jump to the newest answer">
-                                ${this.isStreaming ? html`<span class="live-dot"></span>` : ''}
-                                Latest
-                            </button>
-                        ` : ''}
-                    </div>
-                ` : ''}
+                ${
+                    hasMultipleResponses
+                        ? html`
+                              <div class="float-nav ${!isOnLatest ? 'not-latest' : ''}">
+                                  <button
+                                      class="nav-btn"
+                                      @click=${this.navigateToPreviousResponse}
+                                      ?disabled=${this.currentResponseIndex <= 0}
+                                      title="Previous response"
+                                  >
+                                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                          <path
+                                              fill-rule="evenodd"
+                                              d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z"
+                                              clip-rule="evenodd"
+                                          />
+                                      </svg>
+                                  </button>
+                                  <span class="response-counter">${this.currentResponseIndex + 1}/${this.responses.length}</span>
+                                  <button
+                                      class="nav-btn"
+                                      @click=${this.navigateToNextResponse}
+                                      ?disabled=${this.currentResponseIndex >= this.responses.length - 1}
+                                      title="Next response"
+                                  >
+                                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                          <path
+                                              fill-rule="evenodd"
+                                              d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z"
+                                              clip-rule="evenodd"
+                                          />
+                                      </svg>
+                                  </button>
+                                  ${
+                            !isOnLatest
+                                ? html`
+                                      <button class="latest-btn" @click=${this.navigateToLatestResponse} title="Jump to the newest answer">
+                                          ${this.isStreaming ? html`<span class="live-dot"></span>` : ''} Latest
+                                      </button>
+                                  `
+                                : ''
+                        }
+                              </div>
+                          `
+                        : ''
+                }
             </div>
 
-            ${hasTranscripts ? html`
-                <div class="transcript-strip ${this.transcriptsExpanded ? 'expanded' : ''}">
-                    <div class="transcript-row" @click=${this.toggleTranscripts} title="${this.transcriptsExpanded ? 'Collapse' : 'Show'} everything heard so far">
-                        <span class="transcript-label">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                                <line x1="12" y1="19" x2="12" y2="23" />
-                            </svg>
-                            Heard
-                        </span>
-                        ${!this.transcriptsExpanded ? html`
-                            <span class="transcript-current ${this.interimTranscript ? 'interim' : ''}">${latestHeard}</span>
-                        ` : html`<span class="transcript-current"></span>`}
-                        <span class="transcript-toggle">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                                <path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 0 1-1.06-.02L10 8.832 6.29 12.77a.75.75 0 1 1-1.08-1.04l4.25-4.5a.75.75 0 0 1 1.08 0l4.25 4.5a.75.75 0 0 1-.02 1.06Z" clip-rule="evenodd" />
-                            </svg>
-                        </span>
-                    </div>
-                    ${this.transcriptsExpanded ? html`
-                        <div class="transcript-history" id="transcriptHistory">
-                            ${this.transcripts.map((t, i) => html`
-                                <div class="transcript-item ${i === this.transcripts.length - 1 && !this.interimTranscript ? 'latest' : ''}">${t}</div>
-                            `)}
-                            ${this.interimTranscript ? html`
-                                <div class="transcript-item interim">${this.interimTranscript}</div>
-                            ` : ''}
-                        </div>
-                    ` : ''}
-                </div>
-            ` : ''}
+            ${
+                hasTranscripts
+                    ? html`
+                          <div class="transcript-strip ${this.transcriptsExpanded ? 'expanded' : ''}">
+                              <div
+                                  class="transcript-row"
+                                  @click=${this.toggleTranscripts}
+                                  title="${this.transcriptsExpanded ? 'Collapse' : 'Show'} everything heard so far"
+                              >
+                                  <span class="transcript-label">
+                                      <svg
+                                          xmlns="http://www.w3.org/2000/svg"
+                                          viewBox="0 0 24 24"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          stroke-width="2"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      >
+                                          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                                          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                                          <line x1="12" y1="19" x2="12" y2="23" />
+                                      </svg>
+                                      Heard
+                                  </span>
+                                  ${
+                            !this.transcriptsExpanded
+                                ? html` <span class="transcript-current ${this.interimTranscript ? 'interim' : ''}">${latestHeard}</span> `
+                                : html`<span class="transcript-current"></span>`
+                        }
+                                  <span class="transcript-toggle">
+                                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                          <path
+                                              fill-rule="evenodd"
+                                              d="M14.77 12.79a.75.75 0 0 1-1.06-.02L10 8.832 6.29 12.77a.75.75 0 1 1-1.08-1.04l4.25-4.5a.75.75 0 0 1 1.08 0l4.25 4.5a.75.75 0 0 1-.02 1.06Z"
+                                              clip-rule="evenodd"
+                                          />
+                                      </svg>
+                                  </span>
+                              </div>
+                              ${
+                        this.transcriptsExpanded
+                            ? html`
+                                  <div class="transcript-history" id="transcriptHistory">
+                                      ${this.transcripts.map(
+                                (t, i) => html`
+                                    <div class="transcript-item ${i === this.transcripts.length - 1 && !this.interimTranscript ? 'latest' : ''}">
+                                        ${t}
+                                    </div>
+                                `
+                            )}
+                                      ${this.interimTranscript ? html` <div class="transcript-item interim">${this.interimTranscript}</div> ` : ''}
+                                  </div>
+                              `
+                            : ''
+                    }
+                          </div>
+                      `
+                    : ''
+            }
 
             <div class="input-bar">
                 <div class="input-bar-inner">
-                    <input
-                        type="text"
-                        id="textInput"
-                        placeholder="Type a message..."
-                        @keydown=${this.handleTextKeydown}
-                    />
+                    <input type="text" id="textInput" placeholder="Type a message..." @keydown=${this.handleTextKeydown} />
                 </div>
                 <button
                     class="talk-btn ${this.isListening ? 'listening' : ''}"
                     @click=${this.handleTalkClick}
                     title="Push to talk — click to start, click again to send"
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
                         <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                         <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                         <line x1="12" y1="19" x2="12" y2="23" />
                     </svg>
                     ${this.isListening ? 'Listening… tap to send' : 'Talk'}
                 </button>
+                <button
+                    class="details-btn"
+                    @click=${this.handleExpandAnswer}
+                    ?disabled=${this.isStreaming || this.responses.length === 0}
+                    title="Show the full detailed answer (${this._shortcutLabel('Shift+D')})"
+                >
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
+                        <line x1="8" y1="6" x2="21" y2="6" />
+                        <line x1="8" y1="12" x2="21" y2="12" />
+                        <line x1="8" y1="18" x2="21" y2="18" />
+                        <line x1="3" y1="6" x2="3.01" y2="6" />
+                        <line x1="3" y1="12" x2="3.01" y2="12" />
+                        <line x1="3" y1="18" x2="3.01" y2="18" />
+                    </svg>
+                    Details
+                </button>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24">
-                            <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 3v7h6l-8 11v-7H5z" />
+                            <path
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M13 3v7h6l-8 11v-7H5z"
+                            />
                         </svg>
                         Analyze Screen
                     </span>
                 </button>
             </div>
         `;
+    }
+
+    _shortcutLabel(combo) {
+        const isMac = !window.cheatingDaddy || window.cheatingDaddy.isMacOS !== false;
+        return (isMac ? 'Cmd+' : 'Ctrl+') + combo;
+    }
+
+    handleExpandAnswer() {
+        if (this.isStreaming) return;
+        if (window.cheatingDaddy && window.cheatingDaddy.expandAnswer) {
+            window.cheatingDaddy.expandAnswer();
+        }
     }
 }
 
