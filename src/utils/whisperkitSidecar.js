@@ -26,7 +26,9 @@ const PORT = 50861;
 // falls through to WebGPU), but avoid churning users through that state.
 const LOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const TRANSCRIBE_TIMEOUT_MS = 60 * 1000;
-const HEALTH_POLL_INTERVAL_MS = 1000;
+// Fine-grained so a ready server is detected promptly — at 1s granularity the
+// poll alone could add ~1s to every cold session start / sidecar restart.
+const HEALTH_POLL_INTERVAL_MS = 250;
 
 // HF ONNX model ids (used by the WebGPU/CPU backends) → variant names in
 // argmaxinc/whisperkit-coreml (the CLI prepends "openai_whisper-").

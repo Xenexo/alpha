@@ -1,7 +1,10 @@
-// Tests for the Claude transport: direct CLI as primary, SDK as one-shot
-// fallback, failure classification, and transcript noise filtering.
-// child_process and the Electron-dependent modules are stubbed via
-// Module._load so no real process is spawned and no Electron import happens.
+// Tests for the Claude transport: persistent stream-json CLI session as
+// primary (one warm process, questions over stdin, interrupt-based
+// supersedes), one-shot CLI spawns as the compatibility path, SDK as one-shot
+// fallback, failure classification, system-design answer mode, and transcript
+// noise filtering. child_process and the Electron-dependent modules are
+// stubbed via Module._load so no real process is spawned and no Electron
+// import happens.
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
@@ -39,15 +42,59 @@ const transcriberStub = {
 };
 const promptsStub = { getSystemPrompt: () => 'TEST SYSTEM PROMPT' };
 
+class FakeStdin {
+    constructor(proc) {
+        this.proc = proc;
+        this.writes = [];
+    }
+    write(chunk) {
+        this.writes.push(String(chunk));
+        for (const line of String(chunk).split('\n')) {
+            if (!line.trim()) continue;
+            let msg;
+            try {
+                msg = JSON.parse(line);
+            } catch {
+                continue;
+            }
+            if (msg.type === 'user') {
+                const text = (msg.message?.content || [])
+                    .filter(b => b.type === 'text' && b.text)
+                    .map(b => b.text)
+                    .join('');
+                this.proc.userMessages.push(text);
+                if (this.proc.onUserMessage) this.proc.onUserMessage(text);
+            } else if (msg.type === 'control_request') {
+                this.proc.controlRequests.push(msg);
+                if (this.proc.onControlRequest) this.proc.onControlRequest(msg);
+            }
+        }
+        return true;
+    }
+    end() {}
+}
+
 class FakeProc extends EventEmitter {
     constructor() {
         super();
         this.stdout = new EventEmitter();
         this.stderr = new EventEmitter();
+        this.stdin = new FakeStdin(this);
+        this.userMessages = []; // parsed text of stream-json user turns
+        this.controlRequests = []; // parsed control_request messages
         this.killed = false;
+        this.closed = false;
+        this.on('close', () => {
+            this.closed = true;
+        });
     }
     kill() {
         this.killed = true;
+        // Mirror a real child process: SIGTERM produces an async 'close'.
+        if (!this.closed) {
+            this.closed = true;
+            setImmediate(() => this.emit('close', null));
+        }
     }
 }
 
@@ -85,6 +132,8 @@ function emitEvents(proc, events) {
     for (const e of events) proc.stdout.emit('data', JSON.stringify(e) + '\n');
 }
 
+// One-shot process script: emits a full success stream then exits (the
+// pre-persistent protocol, still used by runClaudeCli and its tests).
 function scriptSuccess({ sessionId = 'sess-1', text = 'the answer' } = {}) {
     return proc => {
         emitEvents(proc, [
@@ -94,6 +143,41 @@ function scriptSuccess({ sessionId = 'sess-1', text = 'the answer' } = {}) {
             { type: 'result', subtype: 'success', result: text, session_id: sessionId },
         ]);
         proc.emit('close', 0);
+    };
+}
+
+// Scripted persistent-session process: answers each stdin user turn with the
+// next queued response and resolves an interrupt control_request with the
+// error result the real CLI emits — the process itself stays alive.
+// Response shapes: {text} full answer; {text, partialOnly} starts streaming
+// and never finishes; {silent} swallows the turn entirely.
+function persistentScript(responses, { sessionId = 'sess-1' } = {}) {
+    return proc => {
+        const respond = () => {
+            const r = responses.shift();
+            if (!r) return;
+            const sid = r.sessionId || sessionId;
+            emitEvents(proc, [{ type: 'system', subtype: 'init', session_id: sid }]);
+            if (r.silent) return;
+            if (r.partialOnly) {
+                emitEvents(proc, [{ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: r.text } } }]);
+                return;
+            }
+            emitEvents(proc, [
+                { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: r.text } } },
+                { type: 'assistant', message: { content: [{ type: 'text', text: r.text }] } },
+                { type: 'result', subtype: 'success', result: r.text, session_id: sid },
+            ]);
+        };
+        proc.onUserMessage = respond;
+        proc.onControlRequest = msg => {
+            if (msg.request?.subtype !== 'interrupt') return;
+            emitEvents(proc, [{ type: 'result', subtype: 'error_during_execution', is_error: true, result: '', session_id: sessionId }]);
+        };
+        // The first user turn is written synchronously at spawn time, before
+        // this behavior installs (spawn behaviors run on setImmediate) —
+        // replay anything already received.
+        for (let i = 0; i < proc.userMessages.length; i++) respond();
     };
 }
 
@@ -164,7 +248,44 @@ test('noise filter: conversational lead-ins are suppressed, real questions pass'
     assert.equal(meaningful('thanks for watching'), false);
 });
 
-// ── Direct CLI invocation ──
+// ── System design detection ──
+
+test('system design detection: design prompts match, concept/behavioral questions do not', () => {
+    const design = [
+        'Design a URL shortener like TinyURL.',
+        'How would you design WhatsApp?',
+        "Let's design Instagram for millions of users",
+        'Can you design a rate limiter for our API?',
+        'Design a notification service that handles a billion events.',
+        'How would you scale this to a billion users?',
+        'Walk me through the high level design of a news feed.',
+        'Now the low level design: design the classes for a parking lot system.',
+    ];
+    for (const q of design) {
+        assert.equal(seam.isSystemDesignQuestion(q), true, `expected design: "${q}"`);
+    }
+    const notDesign = [
+        'What is a mutex?',
+        'How does TCP work?',
+        'What design patterns do you know?',
+        'Tell me about a time you designed a system for your team.',
+        'Explain consistent hashing',
+        'What is the difference between SQL and NoSQL?',
+    ];
+    for (const q of notDesign) {
+        assert.equal(seam.isSystemDesignQuestion(q), false, `expected NOT design: "${q}"`);
+    }
+});
+
+test('whisper context prompt covers system-design vocabulary for technical profiles only', () => {
+    const p = seam.whisperContextPromptForProfile('interview');
+    for (const term of ['consistent hashing', 'CAP theorem', 'sharding', 'idempotency', 'p99 latency', 'fan-out']) {
+        assert.ok(p.includes(term), `vocabulary must include "${term}"`);
+    }
+    assert.equal(seam.whisperContextPromptForProfile('relationship'), '');
+});
+
+// ── Direct one-shot CLI invocation (compatibility path) ──
 
 test('CLI streaming success: streams partials, returns text, adopts session id', async () => {
     resetAll();
@@ -240,6 +361,71 @@ test('CLI empty output: clean exit with no events is reported as no response', a
     assert.match(result.error, /no response/i);
 });
 
+// ── Persistent session transport ──
+
+test('persistent session: consecutive questions reuse one warm process', async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'answer one' }, { text: 'answer two', sessionId: 'sess-live' }]));
+
+    const r1 = await claude.sendClaudeText('What is a semaphore?');
+    const r2 = await claude.sendClaudeText('What is a monitor?');
+    assert.equal(r1.success, true);
+    assert.equal(r1.text, 'answer one');
+    assert.equal(r2.text, 'answer two');
+    assert.equal(spawnCalls.length, 1, 'the second question must reuse the warm process');
+    assert.ok(spawnCalls[0].args.includes('--input-format'), 'persistent spawn must use stream-json input');
+    assert.deepEqual(spawnCalls[0].proc.userMessages, ['What is a semaphore?', 'What is a monitor?']);
+    assert.equal(seam.getStateForTests().persistentAlive, true, 'the process must stay alive between turns');
+    assert.equal(seam.getStateForTests().cliSessionId, 'sess-live');
+    assert.equal(savedTurns.length, 2);
+});
+
+test('persistent crash mid-turn falls back to the SDK; the next question respawns the session', async () => {
+    resetAll();
+    spawnQueue.push(proc => {
+        proc.stderr.emit('data', 'boom: unexpected crash\n');
+        proc.emit('close', 1);
+    });
+    seam.setQueryFnForTests(() =>
+        (async function* () {
+            yield { type: 'assistant', message: { content: [{ type: 'text', text: 'sdk answer' }] } };
+            yield { type: 'result', subtype: 'success', result: 'sdk answer', session_id: 'sdk-sess' };
+        })()
+    );
+
+    const r1 = await claude.sendClaudeText('first question');
+    assert.equal(r1.success, true);
+    assert.equal(r1.text, 'sdk answer');
+    assert.ok(statusMessages.some(s => /retrying via SDK/i.test(s)));
+
+    spawnQueue.push(persistentScript([{ text: 'back on the CLI' }]));
+    const r2 = await claude.sendClaudeText('second question');
+    assert.equal(r2.text, 'back on the CLI');
+    assert.equal(spawnCalls.length, 2, 'the next question must respawn the persistent session');
+});
+
+test('CLI that rejects stream-json input permanently falls back to one-shot spawns', async () => {
+    resetAll();
+    spawnQueue.push(proc => {
+        proc.stderr.emit('data', "error: unknown option '--input-format'\n");
+        proc.emit('close', 1);
+    });
+    seam.setQueryFnForTests(() =>
+        (async function* () {
+            yield { type: 'result', subtype: 'success', result: 'sdk answer', session_id: 'sdk-sess' };
+        })()
+    );
+
+    await claude.sendClaudeText('first question');
+    assert.equal(seam.getStateForTests().persistentDisabled, true, 'a usage error must disable persistent mode');
+
+    spawnQueue.push(scriptSuccess({ text: 'one-shot answer' }));
+    const r2 = await claude.sendClaudeText('second question');
+    assert.equal(r2.text, 'one-shot answer');
+    assert.equal(spawnCalls[1].args[0], '-p');
+    assert.equal(spawnCalls[1].args[1], 'second question', 'one-shot mode passes the prompt as argv');
+});
+
 // ── sendClaudeText orchestration ──
 
 test('resume failure: retries once without --resume, then succeeds', async () => {
@@ -249,7 +435,7 @@ test('resume failure: retries once without --resume, then succeeds', async () =>
         proc.stderr.emit('data', 'No conversation found with session ID: stale-session\n');
         proc.emit('close', 1);
     });
-    spawnQueue.push(scriptSuccess({ sessionId: 'fresh-session', text: 'fresh answer' }));
+    spawnQueue.push(persistentScript([{ text: 'fresh answer', sessionId: 'fresh-session' }]));
 
     const result = await claude.sendClaudeText('what is a mutex?');
     assert.equal(result.success, true);
@@ -307,16 +493,40 @@ test('cancelled CLI request does not trigger the SDK fallback', async () => {
     assert.equal(queryCalls.length, 0, 'a cancel must not reach the SDK');
 });
 
+// ── System design answer mode ──
+
+test('design question gets the structured framework injected; the clean question is saved', async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'design answer' }]));
+
+    const result = await claude.sendClaudeText('How would you design WhatsApp?');
+    assert.equal(result.success, true);
+    const sent = spawnCalls[0].proc.userMessages[0];
+    assert.match(sent, /SYSTEM DESIGN QUESTION — STRUCTURED ANSWER MODE/);
+    assert.match(sent, /\*\*Trade-offs\*\*/);
+    assert.match(sent, /\*\*Capacity\*\*/);
+    assert.ok(sent.endsWith('How would you design WhatsApp?'), 'the raw question must close the prompt');
+    assert.equal(savedTurns[0][0], 'How would you design WhatsApp?', 'saved history must not contain the injected rules');
+});
+
+test('non-design question is sent verbatim', async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'plain answer' }]));
+
+    await claude.sendClaudeText('What is a deadlock?');
+    assert.equal(spawnCalls[0].proc.userMessages[0], 'What is a deadlock?');
+});
+
 // ── Dispatch latency ──
 
 test('finalized transcript dispatches immediately even when the pipeline reports busy', async () => {
     resetAll();
     pipelineBusy = true; // must NOT hold the flush (the old 3s MAX_FLUSH_HOLD_MS behavior)
-    spawnQueue.push(scriptSuccess({ text: 'quick answer' }));
+    spawnQueue.push(persistentScript([{ text: 'quick answer' }]));
 
     const queuedAt = Date.now();
     seam.queueTranscript('What is idempotency?');
-    await waitFor(() => spawnCalls.length === 1, { timeout: 1000 });
+    await waitFor(() => spawnCalls.length === 1 && spawnCalls[0].proc.userMessages.length === 1, { timeout: 1000 });
     const dispatchDelay = Date.now() - queuedAt;
     assert.ok(dispatchDelay < 500, `dispatch took ${dispatchDelay}ms — busy-pipeline hold has crept back in`);
     await waitFor(() => rendererEvents.some(e => e.channel === 'response-complete'));
@@ -324,41 +534,55 @@ test('finalized transcript dispatches immediately even when the pipeline reports
 
 test('fragments within the merge debounce are sent as one request', async () => {
     resetAll();
-    spawnQueue.push(scriptSuccess({ text: 'merged answer' }));
+    spawnQueue.push(persistentScript([{ text: 'merged answer' }]));
 
     seam.queueTranscript('What is');
     await new Promise(r => setTimeout(r, 30));
     seam.queueTranscript('a race condition?');
 
     await waitFor(() => rendererEvents.some(e => e.channel === 'response-complete'));
-    assert.equal(spawnCalls.length, 1, 'both fragments must merge into a single request');
-    assert.equal(spawnCalls[0].args[1], 'What is a race condition?');
+    assert.equal(spawnCalls.length, 1);
+    assert.deepEqual(spawnCalls[0].proc.userMessages, ['What is a race condition?'], 'both fragments must merge into a single request');
 });
 
-test('speech after dispatch supersedes the in-flight answer with the merged transcript', async () => {
+test('mid-sentence fragment waits for its continuation before dispatch', async () => {
     resetAll();
-    spawnQueue.push(proc => {
-        // First request starts streaming but never finishes — it will be superseded
-        emitEvents(proc, [
-            { type: 'system', subtype: 'init', session_id: 'stale' },
-            { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial…' } } },
-        ]);
-    });
+    spawnQueue.push(persistentScript([{ text: 'merged design answer' }]));
 
-    seam.queueTranscript('What is Kubernetes');
-    await waitFor(() => spawnCalls.length === 1);
+    // No terminal punctuation → the speaker is still building the question.
+    seam.queueTranscript('Okay so I want you to design');
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(spawnCalls.length, 0, 'an incomplete fragment must not dispatch at the fast debounce');
 
-    spawnQueue.push(scriptSuccess({ text: 'combined answer' }));
-    seam.queueTranscript('and how does it differ from Docker?');
+    seam.queueTranscript('a chat system like WhatsApp?');
+    await waitFor(() => rendererEvents.some(e => e.channel === 'response-complete'));
+    assert.equal(spawnCalls[0].proc.userMessages.length, 1, 'both fragments must merge into one request');
+    assert.match(spawnCalls[0].proc.userMessages[0], /design a chat system like WhatsApp\?$/);
+});
 
-    // The cancelled first request also emits response-complete (the renderer
-    // only uses it to stop the streaming indicator), so wait for the resend.
-    await waitFor(() => spawnCalls.length === 2);
+test('speech after dispatch interrupts the in-flight answer and resends combined on the warm process', async () => {
+    resetAll();
+    spawnQueue.push(
+        persistentScript([
+            { text: 'partial…', partialOnly: true }, // first request streams but never finishes
+            { text: 'combined answer', sessionId: 'sess-2' },
+        ])
+    );
+
+    seam.queueTranscript('What is Kubernetes?');
+    await waitFor(() => spawnCalls.length === 1 && spawnCalls[0].proc.userMessages.length === 1);
+
+    seam.queueTranscript('And how does it differ from Docker?');
+
+    await waitFor(() => spawnCalls[0].proc.userMessages.length === 2);
     await waitFor(() => rendererEvents.some(e => e.channel === 'new-response' && e.data.includes('combined answer')));
-    assert.equal(spawnCalls[0].proc.killed, true, 'the stale request must be cancelled');
-    assert.equal(spawnCalls[1].args[1], 'What is Kubernetes and how does it differ from Docker?');
+    const proc = spawnCalls[0].proc;
+    assert.equal(spawnCalls.length, 1, 'the supersede must reuse the warm process, not respawn');
+    assert.equal(proc.killed, false, 'the persistent process must survive the supersede');
+    assert.equal(proc.controlRequests.length, 1, 'the stale turn must be interrupted over stdin');
+    assert.equal(proc.controlRequests[0].request.subtype, 'interrupt');
+    assert.equal(proc.userMessages[1], 'What is Kubernetes? And how does it differ from Docker?');
     assert.ok(rendererEvents.some(e => e.channel === 'response-superseded'));
-    assert.ok(rendererEvents.some(e => e.channel === 'new-response' && e.data.includes('combined answer')));
 });
 
 // ── Transport-ready gating ──
@@ -374,7 +598,7 @@ test('transcript heard during Claude warm-up is queued, then answered once ready
     assert.ok(statusMessages.some(s => /Claude preparing/i.test(s)));
     assert.equal(seam.getStateForTests().pendingCount, 1, 'the transcript must stay queued, not dropped');
 
-    spawnQueue.push(scriptSuccess({ text: 'a binary tree is…' }));
+    spawnQueue.push(persistentScript([{ text: 'a binary tree is…' }]));
     seam.setStateForTests({ transportReady: true });
 
     await waitFor(() => rendererEvents.some(e => e.channel === 'response-complete'));
@@ -395,22 +619,35 @@ test('expand before any answer declines with a helpful message', async () => {
 
 test('expand re-asks in depth for the last question and preserves it across repeats', async () => {
     resetAll();
+    spawnQueue.push(persistentScript([{ text: 'a short 3-line answer' }, { text: 'the detailed version' }, { text: 'even more detail' }]));
+
     // Answer a short question first so the question is recorded.
-    spawnQueue.push(scriptSuccess({ text: 'a short 3-line answer' }));
     await claude.sendClaudeText('How does TCP work?');
 
-    // First expansion.
-    spawnQueue.push(scriptSuccess({ text: 'the detailed version' }));
     const r1 = await claude.expandLastAnswer();
     assert.equal(r1.success, true);
-    const expandPrompt = spawnCalls[1].args[1]; // ['-p', <prompt>, ...]
+    const proc = spawnCalls[0].proc;
+    const expandPrompt = proc.userMessages[1];
     assert.match(expandPrompt, /How does TCP work\?/, 'expansion must reference the original question');
     assert.match(expandPrompt, /IGNORE THE SHORT/i, 'expansion must lift the short-answer length limit');
 
     // A second expansion still targets the ORIGINAL question, not the expand prompt.
-    spawnQueue.push(scriptSuccess({ text: 'even more detail' }));
     const r2 = await claude.expandLastAnswer();
     assert.equal(r2.success, true);
-    assert.match(spawnCalls[2].args[1], /How does TCP work\?/);
+    assert.match(proc.userMessages[2], /How does TCP work\?/);
     assert.equal(seam.getStateForTests().isTranscriptResponseInFlight, false);
+});
+
+test('expanding a design answer uses the full-framework design expansion prompt', async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'short design answer' }, { text: 'the full design' }]));
+
+    await claude.sendClaudeText('Design a news feed for millions of users.');
+    const r = await claude.expandLastAnswer();
+    assert.equal(r.success, true);
+    const expandPrompt = spawnCalls[0].proc.userMessages[1];
+    assert.match(expandPrompt, /SYSTEM DESIGN EXPANSION/);
+    assert.match(expandPrompt, /capacity estimation/i);
+    assert.match(expandPrompt, /trade-offs/i);
+    assert.match(expandPrompt, /Design a news feed for millions of users\./);
 });

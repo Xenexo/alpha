@@ -36,10 +36,13 @@ const PRE_SPEECH_FRAMES = 8;
 let preSpeechBuffer = [];
 
 // Streaming partial transcription. While the user is still speaking, transcribe
-// the audio accumulated so far every ~1.5s and emit it as an interim result so
+// the audio accumulated so far every ~0.8s and emit it as an interim result so
 // the UI can show the words live instead of waiting for the end-of-utterance
-// silence plus a whole-utterance inference pass. Each frame is ~0.1s.
-const INTERIM_INTERVAL_FRAMES = 15;
+// silence plus a whole-utterance inference pass. Each frame is ~0.1s. This is
+// a floor, not a schedule: runInterim only advances the counter when it
+// actually starts an inference, so on a slow backend the effective cadence
+// degrades gracefully to max(interval, inference time).
+const INTERIM_INTERVAL_FRAMES = 8;
 let lastInterimFrameCount = 0;
 
 // Continuous speech with no VAD-length pause (a video, a monologue) would
@@ -56,7 +59,11 @@ const HARD_SPLIT_FRAMES = 180; // ~18s: split unconditionally
 const SPLIT_OVERLAP_FRAMES = 5;
 // Interims are disposable live captions — transcribing the whole buffer makes
 // each one slower than the last for no benefit. Only the recent tail matters.
-const INTERIM_MAX_FRAMES = 100; // ~10s
+// Whisper pads every input to a 30s window (encoder cost is constant), but
+// decode time scales with the spoken tokens in the tail, so a shorter tail
+// means snappier captions and a shorter worst-case wait for a final that
+// queues behind an in-flight interim.
+const INTERIM_MAX_FRAMES = 80; // ~8s
 
 // VAD configuration
 const VAD_MODES = {
@@ -192,11 +199,13 @@ function processVAD(pcm16kBuffer) {
         }
 
         // Emit a live partial transcript roughly every INTERIM_INTERVAL_FRAMES.
-        // runInterim self-throttles if the pipeline is still busy, so advancing
-        // the counter here (even when an interim is skipped) just means the next
-        // attempt happens one interval later — never a backlog of interim jobs.
-        if (speechBuffers.length - lastInterimFrameCount >= INTERIM_INTERVAL_FRAMES) {
-            lastInterimFrameCount = speechBuffers.length;
+        // runInterim advances the counter only when it actually starts, so a
+        // busy-pipeline skip is retried on the very next frame (~0.1s) and the
+        // caption fires the moment inference frees up, instead of stalling a
+        // whole interval. Never launch on a silence frame: an interim started
+        // during the end-of-utterance run-out would make the imminent final
+        // transcript queue behind a disposable caption job.
+        if (isVoice && speechBuffers.length - lastInterimFrameCount >= INTERIM_INTERVAL_FRAMES) {
             runInterim();
         }
     }
@@ -210,6 +219,10 @@ function processVAD(pcm16kBuffer) {
 async function runInterim() {
     if (isTranscribing || !isSpeaking || speechBuffers.length === 0) return;
 
+    // Consume the interval only now that inference is actually starting (the
+    // guard above and this line run synchronously, so no second interim can
+    // slip in between them).
+    lastInterimFrameCount = speechBuffers.length;
     isTranscribing = true;
     const generation = transcriptionGeneration;
     const snapshot = Buffer.concat(speechBuffers.slice(-INTERIM_MAX_FRAMES));
