@@ -248,6 +248,37 @@ test('noise filter: conversational lead-ins are suppressed, real questions pass'
     assert.equal(meaningful('thanks for watching'), false);
 });
 
+test('noise filter: Devanagari speech survives (bare \\W treated every Hindi char as punctuation)', () => {
+    const meaningful = seam.isMeaningfulTranscript;
+    for (const real of [
+        'मुझे एक सवाल है',
+        'क्या आप system design समझा सकते हैं',
+        'क्यों', // single interrogative word, no "?" — Hindi output ends with "।"
+        'बताइए कि load balancer कैसे काम करता है।',
+    ]) {
+        assert.equal(meaningful(real), true, `expected "${real}" to pass`);
+    }
+    for (const noise of ['ठीक है', 'हाँ', 'अच्छा तो', 'तो अच्छा', 'नमस्ते', 'देखने के लिए धन्यवाद', 'सब्सक्राइब करें']) {
+        assert.equal(meaningful(noise), false, `expected "${noise}" to be filtered`);
+    }
+});
+
+// ── Whisper bias prompt ──
+
+test('whisper bias prompt matches the transcription script: Devanagari for hi, Latin for en', () => {
+    const hi = seam.whisperContextPromptForProfile('interview', 'hi');
+    const en = seam.whisperContextPromptForProfile('interview', 'en');
+    assert.match(hi, /[ऀ-ॿ]/, 'the Hindi prompt must be in Devanagari or it drags decoding into English');
+    assert.ok(!/[ऀ-ॿ]/.test(en), 'the English prompt must stay Latin-only');
+    // Tech jargon stays in Latin in both — Indian interviews are spoken Hinglish.
+    for (const term of ['XSS', 'Kubernetes', 'CAP theorem']) {
+        assert.ok(hi.includes(term), `expected the Hindi prompt to keep "${term}" in Latin script`);
+    }
+    // Defaults and non-technical profiles are unchanged.
+    assert.equal(seam.whisperContextPromptForProfile('interview'), en);
+    assert.equal(seam.whisperContextPromptForProfile('relationship', 'hi'), '');
+});
+
 // ── System design detection ──
 
 test('system design detection: design prompts match, concept/behavioral questions do not', () => {

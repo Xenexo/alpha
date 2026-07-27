@@ -538,6 +538,15 @@ async function initWhisper(modelName, { contextPrompt = '' } = {}) {
         whisperLanguage = 'en';
     }
     whisperContextPrompt = contextPrompt;
+    // tiny/base are trained overwhelmingly on English; on Hindi they garble the
+    // audio or silently translate it. Surface it rather than letting the user
+    // conclude Hindi transcription is broken.
+    if (whisperLanguage !== 'en' && /whisper-(tiny|base)$/i.test(modelName)) {
+        console.warn(
+            `[Transcriber] Model "${modelName}" is weak for language "${whisperLanguage}" — recommend whisper-large-v3-turbo or whisper-small`
+        );
+        sendToRenderer('update-status', `${modelName.split('/').pop()} is inaccurate for non-English — switch to Large v3 Turbo in settings`);
+    }
     return await loadWhisperPipeline(modelName);
 }
 

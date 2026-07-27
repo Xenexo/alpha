@@ -10,6 +10,7 @@ const path = require('path');
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn, saveScreenAnalysis } = require('./gemini');
 const transcriber = require('./transcriber');
+const storage = require('../storage');
 
 // ── State ──
 
@@ -250,10 +251,27 @@ const WHISPER_TECH_CONTEXT_PROMPT =
     'PostgreSQL, DynamoDB, Cassandra, MongoDB, S3, Elasticsearch, API gateway, circuit breaker, bloom filter, LRU cache, TTL, ' +
     'data structures, algorithms, Big O, hash map, binary tree, heap, linked list, SQL, NoSQL, concurrency, mutex, deadlock, design patterns.';
 
+// Whisper's prompt sets the *script and style* it expects to emit, not just the
+// vocabulary. Conditioning a Hindi session on the all-Latin English prompt
+// above drags the decoder toward English output — it romanizes or mistranslates
+// Hindi speech instead of writing Devanagari. The Hindi prompt is therefore
+// written in Devanagari, but keeps the technical terms in Latin script: Indian
+// interviews are spoken in Hinglish, where the jargon stays English even when
+// the sentence around it is Hindi, and that is exactly the mix we want back.
+const WHISPER_TECH_CONTEXT_PROMPT_HI =
+    'सॉफ्टवेयर इंजीनियरिंग इंटरव्यू की बातचीत। विषय: XSS, CSRF, SQL injection, OAuth, JWT, REST API, GraphQL, gRPC, frontend, backend, ' +
+    'React, Node.js, TypeScript, Python, Kubernetes, Docker, CI/CD, microservices, caching, Redis, Kafka, rate limiting, load balancer, ' +
+    'system design, HLD, LLD, sharding, consistent hashing, replication, partitioning, CAP theorem, eventual consistency, ' +
+    'CDN, WebSocket, pub/sub, message queue, idempotency, QPS, p99 latency, throughput, PostgreSQL, DynamoDB, Cassandra, MongoDB, S3, ' +
+    'Elasticsearch, API gateway, LRU cache, TTL, data structures, algorithms, Big O, hash map, binary tree, heap, linked list, SQL, NoSQL, ' +
+    'concurrency, mutex, deadlock, design patterns. उम्मीदवार हिंदी और अंग्रेज़ी मिलाकर बोलता है।';
+
 // Profiles where the speaker is expected to use technical vocabulary; the
 // unknown/default profile maps to interview in prompts.js, so it counts too.
-function whisperContextPromptForProfile(profile) {
-    return !profile || profile === 'interview' || profile === 'exam' ? WHISPER_TECH_CONTEXT_PROMPT : '';
+function whisperContextPromptForProfile(profile, language = 'en') {
+    const isTechnical = !profile || profile === 'interview' || profile === 'exam' || profile === 'mcq';
+    if (!isTechnical) return '';
+    return language === 'hi' ? WHISPER_TECH_CONTEXT_PROMPT_HI : WHISPER_TECH_CONTEXT_PROMPT;
 }
 
 // Whisper hallucinates stock phrases on silence/noise (subtitle artifacts) and
@@ -273,8 +291,23 @@ const TRANSCRIPT_NOISE_PATTERNS = [
     // These are short multi-word fragments, so the single-word gate below
     // misses them. Genuine short questions end with "?" and never match.
     /^(o?k(ay)?|alright|all right|right|so|well|now|anyway|and|but|then|yeah|you know|i mean|let'?s see)((,| )+(so|then|well|yeah|now|right|o?kay?|um+|uh+|anyway|you know|i mean))*[,.!…]*$/,
-    /^\W*$/, // punctuation / symbols only
+    // Punctuation / symbols only. Must be Unicode-aware: bare `\W` is
+    // [^A-Za-z0-9_], so every Devanagari character counts as punctuation and a
+    // whole Hindi utterance would be discarded as noise.
+    /^[^\p{L}\p{N}]*$/u,
 ];
+
+// Hindi filler and acknowledgements, the Devanagari counterparts of the English
+// list above. Whisper also hallucinates Hindi subtitle boilerplate on silence
+// ("नमस्कार", channel sign-offs), so those go here too.
+const TRANSCRIPT_NOISE_PATTERNS_HI = [
+    /^(ठीक|ठीक है|अच्छा|हाँ|हां|जी|जी हाँ|नहीं|हम्म|अरे|ओके|ओहो|बस|सही|बिल्कुल|शुक्रिया|धन्यवाद|नमस्ते|नमस्कार|अलविदा)[।.!,…]*$/,
+    /^(देखने के लिए धन्यवाद|सब्सक्राइब कर(ें|िए)|चैनल को सब्सक्राइब कर(ें|िए))[।.!]*$/,
+    // Lead-ins: "तो", "अच्छा तो", "हाँ जी तो" — winding up, nothing asked yet.
+    /^(तो|अच्छा|ठीक|हाँ|हां|जी|अब|फिर|और|लेकिन|मतलब|यानी)((,| )+(तो|अच्छा|ठीक|हाँ|हां|जी|अब|फिर|और|लेकिन|मतलब|यानी|ओके))*[।.!,…]*$/,
+];
+
+const DEVANAGARI_RE = /[ऀ-ॿ]/;
 
 // A meaningful turn for a real-time answer assistant is one Claude should
 // actually respond to: not pure filler, not a bare acknowledgement, and long
@@ -282,10 +315,17 @@ const TRANSCRIPT_NOISE_PATTERNS = [
 function isMeaningfulTranscript(text) {
     const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
     if (!normalized) return false;
-    if (TRANSCRIPT_NOISE_PATTERNS.some(re => re.test(normalized))) return false;
+    const hasDevanagari = DEVANAGARI_RE.test(normalized);
+    const patterns = hasDevanagari ? [...TRANSCRIPT_NOISE_PATTERNS, ...TRANSCRIPT_NOISE_PATTERNS_HI] : TRANSCRIPT_NOISE_PATTERNS;
+    if (patterns.some(re => re.test(normalized))) return false;
     // Single-word, non-question fragments are almost always filler or noise.
+    // Hindi output rarely carries a "?" (Whisper ends the sentence with "।"),
+    // so an interrogative word counts as a question marker there instead.
+    const isQuestion =
+        /\?[।.!…\s]*$/.test(normalized) ||
+        (hasDevanagari && /(क्या|क्यों|कैसे|कब|कहाँ|कहां|कौन|कितना|कितने|कितनी|बताओ|बताइए|समझाओ|समझाइए)/.test(normalized));
     const wordCount = normalized.split(' ').length;
-    if (wordCount < 2 && !normalized.endsWith('?')) return false;
+    if (wordCount < 2 && !isQuestion) return false;
     return true;
 }
 
@@ -1449,7 +1489,17 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
 
         // Load Whisper for speech-to-text (audio → transcript → Claude)
         const whisperStartedAt = Date.now();
-        const pipeline = await transcriber.initWhisper(whisperModel, { contextPrompt: whisperContextPromptForProfile(profile) });
+        // The bias prompt must be in the same script Whisper is asked to emit,
+        // so it depends on the transcription language, not just the profile.
+        let whisperLanguage = 'en';
+        try {
+            whisperLanguage = storage.getPreferences().whisperLanguage || 'en';
+        } catch (error) {
+            console.warn('[Claude] Could not read whisperLanguage preference, defaulting to en:', error.message);
+        }
+        const pipeline = await transcriber.initWhisper(whisperModel, {
+            contextPrompt: whisperContextPromptForProfile(profile, whisperLanguage),
+        });
         if (!pipeline) {
             sendToRenderer('session-initializing', false);
             return false;

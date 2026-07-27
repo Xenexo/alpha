@@ -1059,6 +1059,20 @@ export class MainView extends LitElement {
                     <option value="hi" ?selected=${this._whisperLanguage === 'hi'}>Hindi</option>
                 </select>
                 <div class="form-hint">Language Whisper listens for — pick Hindi for Hindi/Hinglish calls</div>
+                ${this._renderHindiModelHint()}
+            </div>
+        `;
+    }
+
+    // The small Whisper models are trained overwhelmingly on English; on Hindi
+    // they mistranscribe or drift into English badly enough that users read it
+    // as "Hindi doesn't work". Say so where the language is chosen.
+    _renderHindiModelHint() {
+        const WEAK_FOR_HINDI = ['Xenova/whisper-tiny', 'Xenova/whisper-base'];
+        if (this._whisperLanguage !== 'hi' || !WEAK_FOR_HINDI.includes(this._whisperModel)) return '';
+        return html`
+            <div class="form-hint" style="color: rgba(255, 180, 80, 0.9)">
+                Tiny and Base are near-unusable for Hindi — switch the model above to Large v3 Turbo (or Small) for usable accuracy.
             </div>
         `;
     }

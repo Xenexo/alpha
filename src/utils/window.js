@@ -6,6 +6,11 @@ let mouseEventsIgnored = false;
 let clipboardWatchInterval = null;
 let lastClipboardText = '';
 let autoSelectionEnabled = false;
+// When speaker (audio-only) mode is active the window must stay hidden even for
+// actions that would normally reveal it (push-to-talk, answer-with-context,
+// etc.) — the whole point is to keep the screen clear. The renderer keeps this
+// in sync via the 'set-speaker-mode' IPC message.
+let speakerModeActive = false;
 
 const DEFAULT_MAIN_WINDOW_SIZE = { width: 1100, height: 800 };
 const MIN_WINDOW_SIZE = { width: 700, height: 320 };
@@ -114,6 +119,7 @@ function getDefaultKeybinds() {
         pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
         answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
         expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
+        toggleSpeakerMode: isMac ? 'Cmd+Shift+P' : 'Ctrl+Shift+P',
     };
 }
 
@@ -164,7 +170,7 @@ function startClipboardWatcher(mainWindow, sendToRenderer) {
         if (current && current !== lastClipboardText && current.trim().length > 0) {
             lastClipboardText = current;
             if (mainWindow && !mainWindow.isDestroyed()) {
-                if (!mainWindow.isVisible()) mainWindow.showInactive();
+                if (!speakerModeActive && !mainWindow.isVisible()) mainWindow.showInactive();
                 sendToRenderer('selection-captured', current.trim());
             }
         }
@@ -355,7 +361,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             globalShortcut.register(keybinds.analyzeScreen, () => {
                 console.log('Analyze screen shortcut triggered');
                 try {
-                    if (!mainWindow.isVisible()) {
+                    if (!speakerModeActive && !mainWindow.isVisible()) {
                         mainWindow.showInactive();
                     }
                     mainWindow.webContents.executeJavaScript(`
@@ -389,7 +395,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
                         sendToRenderer('update-status', 'No text selected or in clipboard');
                         return;
                     }
-                    if (!mainWindow.isVisible()) {
+                    if (!speakerModeActive && !mainWindow.isVisible()) {
                         mainWindow.showInactive();
                     }
                     sendToRenderer('selection-captured', result.text.trim());
@@ -409,7 +415,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             globalShortcut.register(keybinds.pushToTalk, () => {
                 console.log('Push-to-talk shortcut triggered');
                 try {
-                    if (!mainWindow.isVisible()) {
+                    if (!speakerModeActive && !mainWindow.isVisible()) {
                         mainWindow.showInactive();
                     }
                     sendToRenderer('push-to-talk-shortcut');
@@ -438,7 +444,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             globalShortcut.register(keybinds.answerWithContext, () => {
                 console.log('Answer-with-context shortcut triggered');
                 try {
-                    if (!mainWindow.isVisible()) {
+                    if (!speakerModeActive && !mainWindow.isVisible()) {
                         mainWindow.showInactive();
                     }
                     sendToRenderer('answer-with-context-shortcut');
@@ -467,7 +473,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             globalShortcut.register(keybinds.expandAnswer, () => {
                 console.log('Expand-answer shortcut triggered');
                 try {
-                    if (!mainWindow.isVisible()) {
+                    if (!speakerModeActive && !mainWindow.isVisible()) {
                         mainWindow.showInactive();
                     }
                     sendToRenderer('expand-answer-shortcut');
@@ -482,6 +488,27 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             }
         } catch (error) {
             console.error(`Failed to register expandAnswer (${keybinds.expandAnswer}):`, error);
+        }
+    }
+
+    // Register toggle speaker-mode shortcut: switch between on-screen answers and
+    // audio-only (window hidden, answers spoken aloud). Deliberately does NOT
+    // show the window — the whole point of the mode is to keep the screen clear.
+    if (keybinds.toggleSpeakerMode) {
+        try {
+            globalShortcut.register(keybinds.toggleSpeakerMode, () => {
+                console.log('Toggle speaker-mode shortcut triggered');
+                sendToRenderer('toggle-speaker-mode-shortcut');
+            });
+            if (globalShortcut.isRegistered(keybinds.toggleSpeakerMode)) {
+                console.log(`Registered toggleSpeakerMode: ${keybinds.toggleSpeakerMode}`);
+            } else {
+                console.warn(
+                    `Could not register toggleSpeakerMode (${keybinds.toggleSpeakerMode}) — likely taken by another app. Rebind it in Customize.`
+                );
+            }
+        } catch (error) {
+            console.error(`Failed to register toggleSpeakerMode (${keybinds.toggleSpeakerMode}):`, error);
         }
     }
 
@@ -523,6 +550,10 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
         }
     });
 
+    ipcMain.on('set-speaker-mode', (event, active) => {
+        speakerModeActive = !!active;
+    });
+
     ipcMain.on('view-changed', (event, view) => {
         if (!mainWindow.isDestroyed()) {
             if (view !== 'assistant') {
@@ -540,6 +571,25 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     ipcMain.on('update-keybinds', (event, newKeybinds) => {
         if (!mainWindow.isDestroyed()) {
             updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
+        }
+    });
+
+    // Deterministically show/hide the window (used by speaker mode, which must
+    // hide the window rather than toggle it blindly).
+    ipcMain.handle('set-window-visibility', async (event, visible) => {
+        try {
+            if (mainWindow.isDestroyed()) {
+                return { success: false, error: 'Window has been destroyed' };
+            }
+            if (visible) {
+                mainWindow.showInactive();
+            } else {
+                mainWindow.hide();
+            }
+            return { success: true };
+        } catch (error) {
+            console.error('Error setting window visibility:', error);
+            return { success: false, error: error.message };
         }
     });
 

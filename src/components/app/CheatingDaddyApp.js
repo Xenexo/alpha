@@ -23,7 +23,9 @@ export class CheatingDaddyApp extends LitElement {
             display: block;
             width: 100%;
             height: 100vh;
-            background: var(--bg-app);
+            /* Transparent: the single background tint is painted by <body> so the
+               backgroundTransparency alpha isn't compounded across stacked layers. */
+            background: transparent;
             color: var(--text-primary);
         }
 
@@ -248,7 +250,9 @@ export class CheatingDaddyApp extends LitElement {
             display: flex;
             flex-direction: column;
             background: url('data:image/svg+xml;utf8,<svg width="20" height="20" xmlns="http://www.w3.org/2000/svg"><circle cx="2" cy="2" r="1" fill="rgba(255,255,255,0.03)"/></svg>');
-            background-color: var(--bg-app);
+            /* No solid fill here — <body> provides the single tinted layer so the
+               transparency slider maps linearly instead of being cubed away. */
+            background-color: transparent;
         }
 
         /* Live mode top bar */
@@ -402,6 +406,7 @@ export class CheatingDaddyApp extends LitElement {
         _storageLoaded: { state: true },
         _updateAvailable: { state: true },
         _whisperDownloading: { state: true },
+        _speakerMode: { state: true },
     };
 
     constructor() {
@@ -435,6 +440,11 @@ export class CheatingDaddyApp extends LitElement {
         this._updateAvailable = false;
         this._whisperDownloading = false;
         this._localVersion = '';
+
+        // Speaker (audio-only) mode: window hidden, answers spoken aloud.
+        this._speakerMode = false;
+        this._ttsDebounceTimer = null;
+        this._lastSpokenText = null;
 
         this._loadFromStorage();
         this._checkForUpdates();
@@ -473,6 +483,7 @@ export class CheatingDaddyApp extends LitElement {
             this.selectedScreenshotInterval = prefs.selectedScreenshotInterval || '5';
             this.selectedImageQuality = prefs.selectedImageQuality || 'medium';
             this.layoutMode = config.layout || 'normal';
+            this._speakerMode = prefs.speakerMode ?? false;
 
             this._storageLoaded = true;
             this.requestUpdate();
@@ -492,11 +503,25 @@ export class CheatingDaddyApp extends LitElement {
                 const replaceStalePartial = this._responseWasSuperseded;
                 this._responseWasSuperseded = false;
                 this._isResponseStreaming = true;
+                // A fresh answer is starting — stop reading the previous one aloud
+                // and let the debounce below re-arm for this one.
+                if (this._speakerMode) {
+                    this._stopSpeaking();
+                    this._lastSpokenText = null;
+                }
                 this.addNewResponse(response, replaceStalePartial);
+                this._scheduleSpeak();
             });
-            ipcRenderer.on('update-response', (_, response) => this.updateCurrentResponse(response));
+            ipcRenderer.on('update-response', (_, response) => {
+                this.updateCurrentResponse(response);
+                this._scheduleSpeak();
+            });
             ipcRenderer.on('response-complete', () => {
                 this._isResponseStreaming = false;
+                // Claude fires this; other providers don't, which is why the
+                // update-debounce fallback also speaks. Both funnel through
+                // _speakLatest(), which de-dupes on the spoken text.
+                this._speakLatest();
             });
             // The in-flight auto-answer was aborted because the speaker kept
             // going; the combined resend replaces the stale partial card and
@@ -504,6 +529,8 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('response-superseded', () => {
                 this._responseWasSuperseded = this._responseWasSuperseded || this._isResponseStreaming;
                 this._transcriptWasSuperseded = true;
+                // The in-flight answer was aborted — don't speak the stale partial.
+                if (this._speakerMode) this._stopSpeaking();
             });
             ipcRenderer.on('new-transcript', (_, transcript) => {
                 if (this._transcriptWasSuperseded && this.transcripts.length > 0) {
@@ -534,6 +561,7 @@ export class CheatingDaddyApp extends LitElement {
                 this._isAudioMuted = muted;
             });
             ipcRenderer.on('audio-mute-shortcut', () => this.handleToggleAudio());
+            ipcRenderer.on('toggle-speaker-mode-shortcut', () => this.toggleSpeakerMode());
             ipcRenderer.on('reconnect-failed', (_, data) => this.addNewResponse(data.message));
             ipcRenderer.on('whisper-downloading', (_, downloading) => {
                 this._whisperDownloading = downloading;
@@ -639,12 +667,17 @@ export class CheatingDaddyApp extends LitElement {
 
     async handleClose() {
         if (this.currentView === 'assistant') {
+            // Ending the session — stop any speech and make sure the window is
+            // visible again so speaker mode never strands the user with no screen.
+            this._stopSpeaking();
+            if (this._speakerMode) await this._setWindowVisible(true);
             cheatingDaddy.stopCapture();
             if (window.require) {
                 const { ipcRenderer } = window.require('electron');
                 await ipcRenderer.invoke('close-session');
             }
             this.sessionActive = false;
+            this._syncSpeakerModeToMain();
             this._stopTimer();
             this.currentView = 'main';
         } else {
@@ -686,10 +719,123 @@ export class CheatingDaddyApp extends LitElement {
         }
     }
 
+    // ── Speaker (audio-only) mode ──
+    // When on, the window is hidden during a session and each answer is spoken
+    // aloud through the speaker instead of shown on screen. Operate via the
+    // global shortcuts (push-to-talk, answer-with-context, toggle-visibility).
+
+    async toggleSpeakerMode() {
+        this._speakerMode = !this._speakerMode;
+        await cheatingDaddy.storage.updatePreference('speakerMode', this._speakerMode);
+        cheatingDaddy.refreshPreferencesCache();
+
+        if (this._speakerMode) {
+            // Announce it out loud so the user knows even once the window is gone.
+            this._speak('Speaker mode on.');
+            this.setStatus('Speaker mode on — answers will be spoken');
+            if (this.sessionActive) await this._setWindowVisible(false);
+        } else {
+            this._stopSpeaking();
+            this.setStatus('Speaker mode off');
+            await this._setWindowVisible(true);
+        }
+        this._syncSpeakerModeToMain();
+        this.requestUpdate();
+    }
+
+    async _setWindowVisible(visible) {
+        if (!window.require) return;
+        try {
+            const { ipcRenderer } = window.require('electron');
+            await ipcRenderer.invoke('set-window-visibility', visible);
+        } catch (err) {
+            console.error('Error setting window visibility:', err);
+        }
+    }
+
+    // Tell the main process whether the window must stay hidden for speaker mode,
+    // so global shortcuts (push-to-talk, etc.) don't reveal it. Only enforced
+    // while a session is active — outside a session the window shows normally.
+    _syncSpeakerModeToMain() {
+        if (!window.require) return;
+        try {
+            const { ipcRenderer } = window.require('electron');
+            ipcRenderer.send('set-speaker-mode', this._speakerMode && this.sessionActive);
+        } catch (err) {
+            console.error('Error syncing speaker mode:', err);
+        }
+    }
+
+    // Debounced speak: fires after streaming settles. Covers providers that
+    // never send 'response-complete' (Gemini, local, cloud). De-duped by
+    // _speakLatest so it never double-reads an answer that 'response-complete'
+    // already spoke.
+    _scheduleSpeak() {
+        if (!this._speakerMode) return;
+        if (this._ttsDebounceTimer) clearTimeout(this._ttsDebounceTimer);
+        this._ttsDebounceTimer = setTimeout(() => this._speakLatest(), 1200);
+    }
+
+    _speakLatest() {
+        if (this._ttsDebounceTimer) {
+            clearTimeout(this._ttsDebounceTimer);
+            this._ttsDebounceTimer = null;
+        }
+        if (!this._speakerMode || this.responses.length === 0) return;
+        const text = this.responses[this.responses.length - 1];
+        if (!text || text === this._lastSpokenText) return;
+        this._lastSpokenText = text;
+        this._speak(text);
+    }
+
+    _speak(text) {
+        try {
+            const synth = window.speechSynthesis;
+            if (!synth) return;
+            const plain = this._toPlainSpeech(text);
+            if (!plain) return;
+            synth.cancel(); // stop anything mid-sentence before the new answer
+            const utter = new SpeechSynthesisUtterance(plain);
+            utter.rate = 1.05;
+            utter.pitch = 1.0;
+            utter.volume = 1.0;
+            synth.speak(utter);
+        } catch (err) {
+            console.error('TTS error:', err);
+        }
+    }
+
+    _stopSpeaking() {
+        try {
+            if (window.speechSynthesis) window.speechSynthesis.cancel();
+        } catch (err) {
+            console.error('Error stopping speech:', err);
+        }
+    }
+
+    // Markdown → readable plain text. Render with the bundled marked parser then
+    // take the text content, so headings/lists/code read cleanly without the
+    // markup symbols. Falls back to the raw string if marked isn't available.
+    _toPlainSpeech(md) {
+        let text = md || '';
+        try {
+            if (window.marked) {
+                const div = document.createElement('div');
+                div.innerHTML = window.marked.parse(text);
+                text = div.textContent || div.innerText || '';
+            }
+        } catch (err) {
+            /* fall back to raw text */
+        }
+        return text.replace(/\s+/g, ' ').trim();
+    }
+
     // ── Session start ──
 
     async handleStart() {
         const prefs = await cheatingDaddy.storage.getPreferences();
+        // Pick up any speaker-mode change made in Settings since the app loaded.
+        this._speakerMode = prefs.speakerMode ?? false;
         const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
 
         if (providerMode === 'cloud') {
@@ -754,6 +900,16 @@ export class CheatingDaddyApp extends LitElement {
         this.sessionActive = true;
         this.currentView = 'assistant';
         this._startTimer();
+        this._lastSpokenText = null;
+
+        // In speaker mode the screen stays clear — hide the window and let
+        // answers come through the speaker. Give it a beat so the session is
+        // fully up before the window disappears.
+        if (this._speakerMode) {
+            this.setStatus('Speaker mode — answers will be spoken. Use shortcuts to control.');
+            setTimeout(() => this._setWindowVisible(false), 400);
+        }
+        this._syncSpeakerModeToMain();
     }
 
     async handleAPIKeyHelp() {

@@ -180,6 +180,8 @@ export class CustomizeView extends LitElement {
         selectedLanguage: { type: String },
         selectedImageQuality: { type: String },
         layoutMode: { type: String },
+        audioMode: { type: String },
+        speakerMode: { type: Boolean },
         keybinds: { type: Object },
         googleSearchEnabled: { type: Boolean },
         backgroundTransparency: { type: Number },
@@ -214,6 +216,7 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
+        this.speakerMode = false;
         this.customPrompt = '';
         this._customPrompts = {};
         this._legacyCustomPrompt = '';
@@ -232,6 +235,7 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
+            this.speakerMode = prefs.speakerMode ?? false;
             this._customPrompts = prefs.customPrompts ?? {};
             this._legacyCustomPrompt = prefs.customPrompt ?? '';
             this.customPrompt = this._resolveCustomPrompt(prefs.selectedProfile || this.selectedProfile);
@@ -255,6 +259,7 @@ export class CustomizeView extends LitElement {
             { value: 'presentation', name: 'Presentation' },
             { value: 'negotiation', name: 'Negotiation' },
             { value: 'exam', name: 'Exam Assistant' },
+            { value: 'mcq', name: 'MCQ (Short Answer)' },
             { value: 'relationship', name: 'Relationship' },
         ];
     }
@@ -314,6 +319,7 @@ export class CustomizeView extends LitElement {
             pushToTalk: isMac ? 'Cmd+Shift+L' : 'Ctrl+Shift+L',
             answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
             expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
+            toggleSpeakerMode: isMac ? 'Cmd+Shift+P' : 'Ctrl+Shift+P',
         };
     }
 
@@ -348,6 +354,11 @@ export class CustomizeView extends LitElement {
                 key: 'expandAnswer',
                 name: 'Show Detailed Answer',
                 description: 'Re-ask Claude for the full, in-depth version of the last short answer (Claude only)',
+            },
+            {
+                key: 'toggleSpeakerMode',
+                name: 'Toggle Speaker Mode',
+                description: 'Switch between on-screen answers and audio-only (window hidden, answers spoken aloud)',
             },
         ];
     }
@@ -401,6 +412,13 @@ export class CustomizeView extends LitElement {
     async handleAudioModeSelect(e) {
         this.audioMode = e.target.value;
         await cheatingDaddy.storage.updatePreference('audioMode', this.audioMode);
+        this.requestUpdate();
+    }
+
+    async handleSpeakerModeSelect(e) {
+        this.speakerMode = e.target.value === 'speaker';
+        await cheatingDaddy.storage.updatePreference('speakerMode', this.speakerMode);
+        cheatingDaddy.refreshPreferencesCache();
         this.requestUpdate();
     }
 
@@ -646,6 +664,38 @@ export class CustomizeView extends LitElement {
         `;
     }
 
+    renderAnswerOutputSection() {
+        const shortcut = (this.keybinds && this.keybinds.toggleSpeakerMode) || '';
+        return html`
+            <section class="surface">
+                <div class="surface-title">Answer Output</div>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label class="form-label">Answer Delivery</label>
+                        <select
+                            class="control"
+                            .value=${this.speakerMode ? 'speaker' : 'screen'}
+                            @change=${this.handleSpeakerModeSelect}
+                        >
+                            <option value="screen">On Screen (show answers)</option>
+                            <option value="speaker">Speaker Only (hidden window, spoken aloud)</option>
+                        </select>
+                    </div>
+                    ${
+                        this.speakerMode
+                            ? html`
+                                  <div class="warning-callout">
+                                      In Speaker Only mode the window is hidden during a session and answers are read aloud through your
+                                      speaker. Control it with the global shortcuts${shortcut ? html` — toggle this mode with <b>${shortcut}</b>` : ''}.
+                                  </div>
+                              `
+                            : ''
+                    }
+                </div>
+            </section>
+        `;
+    }
+
     renderLanguageSection() {
         return html`
             <section class="surface">
@@ -761,7 +811,8 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
+                    ${this.renderAudioSection()} ${this.renderAnswerOutputSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()}
+                    ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

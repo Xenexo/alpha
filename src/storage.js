@@ -29,6 +29,10 @@ const DEFAULT_PREFERENCES = {
     selectedImageQuality: 'medium',
     advancedMode: false,
     audioMode: 'speaker_only',
+    // Speaker (audio-only) mode: when true, the window is hidden during a
+    // session and answers are spoken aloud through the speaker instead of shown
+    // on screen. Toggled at runtime with the toggleSpeakerMode shortcut.
+    speakerMode: false,
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
