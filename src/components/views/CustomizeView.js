@@ -34,6 +34,33 @@ export class CustomizeView extends LitElement {
                 transform: rotate(45deg);
             }
 
+            /* Same shape as .warning-callout, but for explaining a mode rather
+               than warning against it. */
+            .info-callout {
+                position: relative;
+                margin-top: 4px;
+                padding: 8px 12px;
+                border: 1px solid var(--border-strong);
+                border-radius: var(--radius-sm);
+                color: var(--text-secondary);
+                font-size: var(--font-size-xs);
+                line-height: 1.4;
+                background: var(--bg-elevated);
+            }
+
+            .info-callout::before {
+                content: '';
+                position: absolute;
+                top: -6px;
+                left: 16px;
+                width: 10px;
+                height: 10px;
+                background: var(--bg-elevated);
+                border-top: 1px solid var(--border-strong);
+                border-left: 1px solid var(--border-strong);
+                transform: rotate(45deg);
+            }
+
             .toggle-row {
                 display: flex;
                 align-items: center;
@@ -383,9 +410,12 @@ export class CustomizeView extends LitElement {
         }
     }
 
-    handleProfileSelect(e) {
-        this.selectedProfile = e.target.value;
-        this.onProfileChange(this.selectedProfile);
+    async handleProfileSelect(e) {
+        const val = e.target.value;
+        this.selectedProfile = val;
+        this.onProfileChange(val);
+        await cheatingDaddy.storage.updatePreference('selectedProfile', val);
+        this.requestUpdate();
     }
 
     handleLanguageSelect(e) {
@@ -641,13 +671,27 @@ export class CustomizeView extends LitElement {
                         <select class="control" .value=${this.audioMode} @change=${this.handleAudioModeSelect}>
                             <option value="speaker_only">Speaker Only (Interviewer)</option>
                             <option value="mic_only">Microphone Only (Me)</option>
-                            <option value="both">Both Speaker and Microphone</option>
+                            <option value="both">Both — answer them, listen to me for context</option>
                         </select>
                     </div>
                     ${
-                        this.audioMode !== 'speaker_only'
+                        this.audioMode === 'both'
                             ? html`
-                                  <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
+                                  <div class="info-callout">
+                                      Your own answers are transcribed but never answered. They're passed to the AI as context, so the next question
+                                      it answers builds on what you already said instead of repeating it. Use headphones — otherwise the mic hears the
+                                      interviewer through your speakers.
+                                  </div>
+                              `
+                            : ''
+                    }
+                    ${
+                        this.audioMode === 'mic_only'
+                            ? html`
+                                  <div class="warning-callout">
+                                      The other side is not captured at all, and your own speech is treated as context rather than as questions — so
+                                      nothing triggers an answer except push-to-talk. Pick "Both" for interviews.
+                                  </div>
                               `
                             : ''
                     }
@@ -672,11 +716,7 @@ export class CustomizeView extends LitElement {
                 <div class="form-grid">
                     <div class="form-group">
                         <label class="form-label">Answer Delivery</label>
-                        <select
-                            class="control"
-                            .value=${this.speakerMode ? 'speaker' : 'screen'}
-                            @change=${this.handleSpeakerModeSelect}
-                        >
+                        <select class="control" .value=${this.speakerMode ? 'speaker' : 'screen'} @change=${this.handleSpeakerModeSelect}>
                             <option value="screen">On Screen (show answers)</option>
                             <option value="speaker">Speaker Only (hidden window, spoken aloud)</option>
                         </select>
@@ -685,8 +725,8 @@ export class CustomizeView extends LitElement {
                         this.speakerMode
                             ? html`
                                   <div class="warning-callout">
-                                      In Speaker Only mode the window is hidden during a session and answers are read aloud through your
-                                      speaker. Control it with the global shortcuts${shortcut ? html` — toggle this mode with <b>${shortcut}</b>` : ''}.
+                                      In Speaker Only mode the window is hidden during a session and answers are read aloud through your speaker.
+                                      Control it with the global shortcuts${shortcut ? html` — toggle this mode with <b>${shortcut}</b>` : ''}.
                                   </div>
                               `
                             : ''
@@ -812,8 +852,7 @@ export class CustomizeView extends LitElement {
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
                     ${this.renderAudioSection()} ${this.renderAnswerOutputSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
-                    ${this.renderPrivacySection()}
+                    ${this.renderKeyboardSection()} ${this.renderPrivacySection()}
                 </div>
             </div>
         `;

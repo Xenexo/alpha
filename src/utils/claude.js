@@ -74,6 +74,130 @@ const RECENT_HEARD_MAX = 8;
 // the in-depth version of THIS question on demand (button / shortcut).
 let lastAnsweredQuestion = null;
 
+// ── The user's own speech (mic) ──
+//
+// Speech from the 'mic' source is the user answering out loud, not a question
+// for Claude. It NEVER triggers a response and never supersedes an in-flight
+// one — it accumulates here and rides along as context on the next interviewer
+// question, so the answer builds on what the user already said instead of
+// repeating it or contradicting their framing.
+//
+// Only speech not yet handed to Claude is kept: both transports retain
+// conversation history (the persistent CLI session, or claudeConversationHistory
+// in api mode), so re-sending an already-sent block would waste tokens and
+// re-assert stale context.
+let unsentUserSpeech = [];
+const USER_SPEECH_MAX = 12;
+// Source label for push-to-talk audio: physically the mic, but intentionally
+// addressed to Claude, so it is answered rather than recorded as context.
+const MIC_ASK_SOURCE = 'mic-ask';
+// A whole answer's worth of the user's speech is legitimately long; cap the
+// injected block so one rambling answer can't crowd out the actual question.
+const USER_SPEECH_CONTEXT_CHARS = 1200;
+
+// Rolling window of recent interviewer speech, kept purely to detect echo (see
+// looksLikeEcho). Unlike recentHeardTranscripts this is NOT cleared when a
+// question is answered — the echo of a question can arrive on the mic after the
+// answer has already started.
+let recentSpeakerSpeech = [];
+const RECENT_SPEAKER_MAX = 6;
+// The last answer Claude produced. In speaker (audio-only) mode the app reads
+// answers aloud, so the mic hears them; without this they would be recorded as
+// the user's own speech and fed back as context.
+let lastAnswerText = '';
+
+// Unless headphones are in use, the mic also picks up the interviewer coming out
+// of the laptop speakers (and, in speaker mode, the app's own spoken answer).
+// Re-labelling that as "the user said it" would poison the context, so drop mic
+// transcripts that substantially repeat something we just heard or just said.
+const ECHO_OVERLAP_RATIO = 0.7;
+
+function echoTokens(text) {
+    return text
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+}
+
+function looksLikeEcho(text) {
+    const words = echoTokens(text);
+    // Under a few words the overlap ratio is noise — "yeah okay right" would
+    // match almost any reference. Short mic fragments are cheap to keep.
+    if (words.length < 4) return false;
+    for (const reference of [...recentSpeakerSpeech, lastAnswerText]) {
+        if (!reference) continue;
+        const referenceWords = new Set(echoTokens(reference));
+        if (referenceWords.size === 0) continue;
+        const hits = words.filter(word => referenceWords.has(word)).length;
+        if (hits / words.length >= ECHO_OVERLAP_RATIO) return true;
+    }
+    return false;
+}
+
+// Record interviewer speech for later echo comparison.
+function rememberSpeakerSpeech(text) {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return;
+    recentSpeakerSpeech.push(trimmed);
+    if (recentSpeakerSpeech.length > RECENT_SPEAKER_MAX) {
+        recentSpeakerSpeech = recentSpeakerSpeech.slice(-RECENT_SPEAKER_MAX);
+    }
+}
+
+// The user spoke. Remember it as context and tell the UI — but do not answer it.
+function recordUserSpeech(text) {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return;
+
+    if (looksLikeEcho(trimmed)) {
+        console.log('[Claude] Mic transcript looks like speaker/answer echo — ignoring:', trimmed.substring(0, 60));
+        return;
+    }
+
+    unsentUserSpeech.push(trimmed);
+    if (unsentUserSpeech.length > USER_SPEECH_MAX) {
+        unsentUserSpeech = unsentUserSpeech.slice(-USER_SPEECH_MAX);
+    }
+    console.log('[Claude] Recorded your speech as context (not answering):', trimmed.substring(0, 80));
+    // Shown in the transcript strip labelled "You" — the user asked to see
+    // their own speech even though it produces no answer.
+    sendToRenderer('user-transcript', trimmed);
+}
+
+// The context block for the next interviewer question, or '' when the user has
+// not said anything new. Does NOT consume the buffer — a superseded or failed
+// request is resent, and the context has to survive to ride along with it.
+// clearUserSpeechContext() is called only once an answer actually lands.
+function peekUserSpeechContext() {
+    if (unsentUserSpeech.length === 0) return '';
+    const speech = unsentUserSpeech.join(' ').replace(/\s+/g, ' ').trim();
+    if (!speech) return '';
+    // Keep the tail — the most recent thing the user said is the most relevant
+    // to the question that just followed it.
+    return speech.length > USER_SPEECH_CONTEXT_CHARS ? '…' + speech.slice(-USER_SPEECH_CONTEXT_CHARS) : speech;
+}
+
+function clearUserSpeechContext() {
+    unsentUserSpeech = [];
+}
+
+// Wrap an interviewer question with whatever the user has said since the last
+// turn. The labels are explicit because the model must answer exactly one of
+// the two blocks — the failure mode to avoid is it responding to the user's own
+// words as if they were the question.
+function withUserSpeechContext(question) {
+    const userSpeech = peekUserSpeechContext();
+    if (!userSpeech) return question;
+    console.log('[Claude] Attaching', userSpeech.length, 'chars of your speech as context');
+    return (
+        `[WHAT I ALREADY SAID OUT LOUD — CONTEXT ONLY, DO NOT ANSWER OR REPLY TO THIS]\n` +
+        `"${userSpeech}"\n\n` +
+        `[THE OTHER PERSON JUST ASKED — ANSWER ONLY THIS]\n` +
+        `${question}`
+    );
+}
+
 // The VAD already waits ~1s of end-of-utterance silence before a transcript is
 // produced, so this debounce only needs to catch transcripts split across that
 // boundary — not re-wait for the user to finish. Keep it short so Claude is
@@ -152,9 +276,10 @@ const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 - When a question is open-ended or under-specified (e.g. "design a RAG system", "how would you build X", "design a rate limiter"), do NOT ask which language, database, framework, or scale to assume. State your assumptions in one short line (e.g. "Assuming Python + pgvector on Postgres:") and immediately give a complete, confident answer the candidate can speak. Choosing reasonable assumptions and defending them IS what "design X" questions are testing.
 - For system design questions specifically, do NOT try to hit every textbook criterion (requirements, estimation, HLD, DB, API, scaling, bottlenecks, failure handling, trade-offs) in one short answer — that reads as shallow, not thorough. Instead pick the 2-3 points the question is actually probing (infer from its wording — "scale to millions" means capacity/sharding, "financial data" means consistency/correctness) and go one level deeper on those, explicitly naming the trade-off/why. It is fine and expected to leave other angles unmentioned in the short answer.
 - Start with the direct answer. Do not add an introduction or restate the question.
-- DEFAULT LENGTH: answer in a short paragraph of 3 to 5 lines (a line is one short sentence or one bullet). This is the quick answer the candidate speaks first — the user can separately ask for a detailed expansion, so keep this first answer tight and do NOT dump everything. Fewer than 3 lines reads as no answer mid-interview — never do it. Exceptions: code, and the demo/hands-on rule below.
-- Structure: line 1 is the direct answer or definition; the remaining lines give only the 2-3 most important points, techniques, or a concrete example an interviewer expects to hear.
-- Use short bullets when the answer naturally enumerates techniques, steps, or comparisons (they are faster to read aloud from); otherwise use short sentences.
+- RESPONSE STRUCTURE FOR INTERVIEW QUESTIONS: Format every answer into two distinct sections:
+  ⚡ **Quick Summary (1-2 Lines Max):** (1-2 direct, punchy sentences the candidate can speak out loud immediately)
+  📋 **Detailed Breakdown:** (Structured bullet points, STAR method details, architecture trade-offs, or code snippet)
+- Structure: section 1 is the 1-2 line spoken summary; section 2 gives the 2-3 key technical points, trade-offs, or concrete code/steps.
 - For code questions, give the approach in one sentence followed by the necessary code (code does not count toward the line cap).
 - If asked to demonstrate, share a demo, implement live, or do hands-on coding, ignore the normal length limit. Give: (1) a one-line approach, (2) ordered implementation steps, (3) complete runnable code, and (4) exact commands to run or verify it.
 - During demos and hands-on coding, keep commentary minimal and prioritize executable instructions and code.
@@ -166,6 +291,8 @@ const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 - NO META-COMMENTARY about the transcript. Never say "too garbled", "I can't understand", "sounds like noise/background", "broken transcript", or otherwise describe or apologize for the input. Either answer directly, or state your one-line assumption and answer.
 - Worked example — input: "Bane, explain quickly, quickly, how a CDN Works, you know what I some disadvantage is advantage is of having a sitting on. I'm sure I love" → reconstruct to "Explain how a CDN works, plus the advantages and disadvantages of using one" (drop "Bane", the "quickly, quickly" repeat, and the "I'm sure I love" tail; "sitting on" ≈ CDN) → answer with the 3-7 line CDN explanation and its pros/cons. Do NOT respond that it is garbled.
 - Never respond with pleasantries such as "You're welcome", "No problem", or "Glad to help" — these are not answers.
+- Some turns arrive with a block labelled "[WHAT I ALREADY SAID OUT LOUD — CONTEXT ONLY, DO NOT ANSWER OR REPLY TO THIS]". That is the candidate's OWN speech, captured from their microphone. NEVER answer it, comment on it, grade it, or treat it as a question. Answer only the block labelled "[THE OTHER PERSON JUST ASKED — ANSWER ONLY THIS]".
+- Use that context block to make the answer continue from where the candidate left off: do NOT repeat points they already made, keep the assumptions, stack, and framing they already committed to out loud (if they said "I'd use Postgres", do not switch to MongoDB), and pick up the specific thread the new question probes. If they stated something wrong and the new question exposes it, correct it in one short line and move on — never lecture them about it.
 `;
 
 // Conversational profiles (relationship) need proactive suggestions on
@@ -174,15 +301,37 @@ const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 const CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT = `
 
 **CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
-- Start with the exact words to say. Do not add an introduction, restate what was heard, or explain your suggestion.
-- Respond in 1-3 short sentences and then stop.
-- If she asks a question, answer it directly in a natural conversational way.
-- STAY ON THE CURRENT TOPIC. Use the conversation so far to know what you are already talking about, and keep your reply inside that thread. Respond to what she actually just said in the context of that topic — do NOT pivot to a new subject.
-- Treat incidental or logistical remarks in context, not as an invitation to change the subject. If you are mid-discussion about one thing and she drops a passing remark (e.g. "it's 7 o'clock", "one sec", "it's getting late"), acknowledge it briefly and return to the thread you were on — do not launch into a new line of questions about it.
-- Only introduce a new topic or a fresh follow-up question when the current thread has clearly and naturally closed (she wraps it up, changes the subject herself, or the exchange has reached a natural end). Never force a new direction just to "keep the call going" — a warm on-topic reply keeps it going better than a topic switch.
-- When she shares a genuine statement, story, or feeling, respond with interest within the current topic; end with a follow-up question ONLY if it deepens the thread you are already on.
+- You MUST provide BOTH: (1) The exact words/answer to say back, AND (2) Topic suggestions for what to talk about next.
+- Structure every response strictly into two concise sections:
+
+💬 **What to say:**
+[1-2 warm, natural spoken sentences to reply out loud]
+
+💡 **Next Topic Suggestions:**
+• 🔥 **Latest:** [Region-specific trend: search web for viral regional reels/memes, new OTT/movie releases, sports, or local weekend plans]
+• ⏳ **Old / Nostalgic:** [Shared memory, childhood story, or deep question]
+
+- ALWAYS search the web for region-specific latest trends (e.g., India / regional trends when Hindi/Hinglish is spoken) to make 🔥 **Latest** topic suggestions fresh, trending, and locally relevant to her region.
 - Reply in the same language/mix as the transcript (Hinglish stays Hinglish, English stays English).
-- The input is a live speech transcript that may contain mis-heard words. An upstream filter already removed pure filler, so reconstruct what she most likely said from the sound and the current topic, then always give a warm, on-thread reply. Never describe the input as garbled or unclear, and never reply with nothing — if a word is fuzzy, respond to the most likely meaning within the topic you are already on.
+- In Hindi/Hinglish, use “tum” by default and never “tu.” Mirror “aap” only if she is already using it.
+- Keep the overall response short, clear, and easy to scan at a single glance during a live call.
+`;
+
+const CLAUDE_MEETING_RESPONSE_PROMPT = `
+
+**CLAUDE REAL-TIME RESPONSE RULES FOR BUSINESS MEETINGS — HIGHEST PRIORITY:**
+- You MUST provide BOTH: (1) What to say back in the meeting, AND (2) A live meeting summary with key discussion points and action items.
+- Structure every response strictly into two concise sections:
+
+💬 **What to say:**
+[1-2 clear, professional spoken sentences to reply or contribute directly out loud]
+
+📌 **Meeting Summary & Key Points:**
+• 📝 **Discussion:** [1-2 bullet points summarizing the core topic discussed so far]
+• ✅ **Decisions / Action Items:** [Key decisions made or assigned next steps with owners]
+
+- Always keep the meeting summary updated based on the conversation history and latest speaker turn.
+- Keep the overall response short, clear, and easy to scan at a single glance during a live meeting.
 `;
 
 // A question is treated as a system-design prompt when it asks to design/
@@ -266,9 +415,19 @@ const WHISPER_TECH_CONTEXT_PROMPT_HI =
     'Elasticsearch, API gateway, LRU cache, TTL, data structures, algorithms, Big O, hash map, binary tree, heap, linked list, SQL, NoSQL, ' +
     'concurrency, mutex, deadlock, design patterns. उम्मीदवार हिंदी और अंग्रेज़ी मिलाकर बोलता है।';
 
+// Relationship calls often switch between Hindi and English word-by-word.
+// A small, conversational bias helps Whisper preserve Devanagari Hindi rather
+// than translating it or drifting into unrelated English subtitle text.
+const WHISPER_RELATIONSHIP_CONTEXT_PROMPT_HI =
+    'यह एक स्वाभाविक हिंदी और हिंग्लिश बातचीत है। आम शब्द: तुम, आप, क्या, क्यों, कैसे, कहाँ, कब, आज, कल, यार, ना, ' +
+    'बताना, सुनाओ, ऑफिस, काम, घर, खाना, फिल्म, गाना, रील, weekend, message, call, funny, really, okay.';
+
 // Profiles where the speaker is expected to use technical vocabulary; the
 // unknown/default profile maps to interview in prompts.js, so it counts too.
 function whisperContextPromptForProfile(profile, language = 'en') {
+    if (profile === 'relationship') {
+        return language === 'hi' ? WHISPER_RELATIONSHIP_CONTEXT_PROMPT_HI : '';
+    }
     const isTechnical = !profile || profile === 'interview' || profile === 'exam' || profile === 'mcq';
     if (!isTechnical) return '';
     return language === 'hi' ? WHISPER_TECH_CONTEXT_PROMPT_HI : WHISPER_TECH_CONTEXT_PROMPT;
@@ -371,11 +530,18 @@ async function flushPendingTranscripts() {
     sendToRenderer('update-status', 'Generating response...');
 
     try {
-        const result = await sendClaudeText(transcription);
+        // Anything the user said out loud since the last turn rides along as
+        // labelled context so the answer continues from where they left off.
+        // recordAsQuestion stays the clean interviewer text so "expand" and the
+        // saved history target the real question, not the wrapper.
+        const result = await sendClaudeText(withUserSpeechContext(transcription), { recordAsQuestion: transcription });
         if (result.success) {
             // This speech has been answered; don't let a later manual trigger
             // re-answer it. Keep only fragments heard after this turn started.
             recentHeardTranscripts = [];
+            // The user's speech is now in the transport's conversation history —
+            // only clear it here, so a superseded or failed request still resends it.
+            clearUserSpeechContext();
             supersedeCount = 0;
         } else if (result.error !== 'Cancelled') {
             // The chain ended (not superseded) — next answer starts fresh.
@@ -410,6 +576,7 @@ function queueTranscript(transcription) {
     // later force an answer on out-of-context speech via answerWithContext.
     const heard = transcription.trim();
     if (heard) {
+        rememberSpeakerSpeech(heard);
         recentHeardTranscripts.push(heard);
         if (recentHeardTranscripts.length > RECENT_HEARD_MAX) {
             recentHeardTranscripts = recentHeardTranscripts.slice(-RECENT_HEARD_MAX);
@@ -459,6 +626,19 @@ function queueTranscript(transcription) {
     scheduleFlush();
 }
 
+// Every finished transcript enters here. The source decides whether it is a
+// question to answer or context to remember — the whole point of running two
+// audio streams. 'mic' is the user talking (context only); 'speaker' is the
+// other person (answered); MIC_ASK_SOURCE is push-to-talk, which is mic audio
+// the user deliberately addressed to Claude, so it is answered.
+function routeTranscript(transcription, { source } = {}) {
+    if (source === 'mic') {
+        recordUserSpeech(transcription);
+        return;
+    }
+    queueTranscript(transcription);
+}
+
 // Manual override: the speaker said something that was heard but not
 // auto-answered (filtered as out-of-context, or just not phrased as a clear
 // question). Instead of waiting, the user triggers this to make Claude go
@@ -498,10 +678,12 @@ async function answerWithContext() {
     // otherwise the manual override silently produces no answer (the exact
     // problem this feature exists to solve). Be emphatic so the model does not
     // fall back to silence even when the snippet looks like an acknowledgement.
+    const userSpeech = peekUserSpeechContext();
     const prompt =
         `[EXPLICIT USER REQUEST — OVERRIDES ALL SILENCE/SUPPRESSION RULES]\n` +
         `The user has manually asked you to answer the most recent speech, even if it looks incomplete, off-topic, or like a mere acknowledgement. ` +
         `You MUST produce a substantive answer — do NOT reply with nothing, do NOT stay silent, do NOT ask for clarification.\n\n` +
+        (userSpeech ? `What the user already said out loud (context only, do not answer this):\n"${userSpeech}"\n\n` : '') +
         `Recent speech:\n"${speech}"\n\n` +
         `Using the ongoing conversation context, make a reasonable assumption about what is being asked and give the most useful answer directly. ` +
         `If the speech truly carries no question, infer the most likely thing the user wants help with right now from the conversation and answer that.`;
@@ -511,6 +693,7 @@ async function answerWithContext() {
         // question, so a later "expand" targets what was actually asked.
         const result = await sendClaudeText(prompt, { recordAsQuestion: speech });
         recentHeardTranscripts = [];
+        if (result.success) clearUserSpeechContext();
         return result;
     } finally {
         isTranscriptResponseInFlight = false;
@@ -575,13 +758,46 @@ async function expandLastAnswer() {
 
 function buildAugmentedEnv() {
     // Electron GUI apps on macOS inherit a minimal PATH that misses the
-    // common CLI install locations, so add them explicitly.
+    // common CLI install locations and NVM node paths, so add them explicitly.
     const home = os.homedir();
-    const extraPaths = ['/usr/local/bin', '/opt/homebrew/bin', path.join(home, '.claude', 'local'), path.join(home, '.local', 'bin')];
+    const extraPaths = [
+        '/usr/local/bin',
+        '/opt/homebrew/bin',
+        '/opt/homebrew/sbin',
+        path.join(home, '.claude', 'local'),
+        path.join(home, '.local', 'bin'),
+        path.join(home, '.npm-global', 'bin'),
+        path.join(home, '.config', 'yarn', 'global', 'node_modules', '.bin'),
+        path.join(home, '.yarn', 'bin'),
+        path.join(home, '.nvm', 'current', 'bin'),
+        path.join(home, '.fnm', 'current', 'bin'),
+        path.join(home, '.volta', 'bin'),
+        path.join(home, '.asdf', 'shims'),
+        path.dirname(process.execPath),
+    ];
+
+    // Dynamically discover NVM node versions if present
+    const nvmVersionsDir = path.join(home, '.nvm', 'versions', 'node');
+    if (fs.existsSync(nvmVersionsDir)) {
+        try {
+            const versions = fs.readdirSync(nvmVersionsDir);
+            for (const v of versions) {
+                const binPath = path.join(nvmVersionsDir, v, 'bin');
+                if (fs.existsSync(binPath)) {
+                    extraPaths.push(binPath);
+                }
+            }
+        } catch (e) {
+            // Non-fatal
+        }
+    }
+
     const sep = process.platform === 'win32' ? ';' : ':';
+    const augmentedPath = [...extraPaths, process.env.PATH || ''].filter(Boolean).join(sep);
+
     return {
         ...process.env,
-        PATH: [process.env.PATH || '', ...extraPaths].filter(Boolean).join(sep),
+        PATH: augmentedPath,
         // Skip update checks/telemetry on CLI boot — measurable spawn-time
         // savings on the one-shot and respawn paths.
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -605,11 +821,27 @@ async function resolveClaudeCli() {
     const env = buildAugmentedEnv();
     const home = os.homedir();
 
+    const nvmCandidates = [];
+    const nvmVersionsDir = path.join(home, '.nvm', 'versions', 'node');
+    if (fs.existsSync(nvmVersionsDir)) {
+        try {
+            const versions = fs.readdirSync(nvmVersionsDir);
+            for (const v of versions) {
+                nvmCandidates.push(path.join(nvmVersionsDir, v, 'bin', 'claude'));
+            }
+        } catch (e) {
+            // Non-fatal
+        }
+    }
+
     const absoluteCandidates = [
         path.join(home, '.claude', 'local', 'claude'),
         '/usr/local/bin/claude',
         '/opt/homebrew/bin/claude',
         path.join(home, '.local', 'bin', 'claude'),
+        path.join(home, '.npm-global', 'bin', 'claude'),
+        path.join(home, '.config', 'yarn', 'global', 'node_modules', '.bin', 'claude'),
+        ...nvmCandidates,
     ];
 
     const candidates = ['claude', ...absoluteCandidates.filter(p => fs.existsSync(p))];
@@ -992,7 +1224,17 @@ function writePersistentMessage(obj) {
 }
 
 function spawnPersistentProc() {
-    const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', claudeModel];
+    const args = [
+        '-p',
+        '--input-format',
+        'stream-json',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--include-partial-messages',
+        '--model',
+        claudeModel,
+    ];
     // Replace Claude Code's large coding-agent prompt (latency + focus), and
     // pre-allow Read so screenshot analysis can run through this session too.
     if (currentSystemPrompt) {
@@ -1156,7 +1398,11 @@ function execPersistentTurn(prompt, { quiet = false, timeoutMs = CLI_TIMEOUT_MS,
             // which resolves it as Cancelled; if the interrupt is ignored,
             // kill the process after a grace period and let the next turn
             // respawn with --resume.
-            const sent = writePersistentMessage({ type: 'control_request', request_id: `interrupt-${++interruptCounter}`, request: { subtype: 'interrupt' } });
+            const sent = writePersistentMessage({
+                type: 'control_request',
+                request_id: `interrupt-${++interruptCounter}`,
+                request: { subtype: 'interrupt' },
+            });
             if (!sent) {
                 stopPersistentProc('interrupt write failed');
                 return;
@@ -1384,7 +1630,9 @@ async function warmUpClaude() {
             result = await runClaudeQuery('Reply with the single word: ready', { quiet: true, timeoutMs: WARMUP_TIMEOUT_MS, adoptSession: false });
         }
         if (result.success) {
-            console.log(`[Claude] Warm-up completed in ${Date.now() - startedAt}ms via ${cli ? (persistentDisabled ? 'one-shot CLI' : 'persistent CLI') : 'SDK'}`);
+            console.log(
+                `[Claude] Warm-up completed in ${Date.now() - startedAt}ms via ${cli ? (persistentDisabled ? 'one-shot CLI' : 'persistent CLI') : 'SDK'}`
+            );
         } else {
             console.warn('[Claude] Warm-up did not succeed (non-fatal):', result.error);
         }
@@ -1444,9 +1692,17 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
     const initStartedAt = Date.now();
     try {
         claudeMode = mode === 'api' ? 'api' : 'cli';
-        const realtimeRules = profile === 'relationship' ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT : CLAUDE_CONCISE_RESPONSE_PROMPT;
+        const realtimeRules =
+            profile === 'relationship'
+                ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT
+                : profile === 'meeting'
+                  ? CLAUDE_MEETING_RESPONSE_PROMPT
+                  : CLAUDE_CONCISE_RESPONSE_PROMPT;
         currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + realtimeRules;
         claudeConversationHistory = [];
+        unsentUserSpeech = [];
+        recentSpeakerSpeech = [];
+        lastAnswerText = '';
         cliSessionId = null;
         isTransportReady = false;
         // A leftover process carries the previous session's model/system
@@ -1507,9 +1763,7 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         console.log(`[Claude] Whisper ready in ${Date.now() - whisperStartedAt}ms`);
 
         transcriber.resetTranscriber();
-        transcriber.setOnTranscript(transcription => {
-            queueTranscript(transcription);
-        });
+        transcriber.setOnTranscript(routeTranscript);
 
         initializeNewSession(profile, customPrompt);
 
@@ -1530,10 +1784,11 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
     }
 }
 
-function processClaudeAudio(monoChunk24k) {
+// source: 'speaker' (system audio / the other person) or 'mic' (the user).
+function processClaudeAudio(monoChunk24k, source = 'speaker') {
     if (!isClaudeActive) return;
     if (isAudioMuted) return; // listening paused — drop the frame, keep capture alive
-    transcriber.processAudio24k(monoChunk24k);
+    transcriber.processAudio24k(monoChunk24k, source);
 }
 
 // Pause/resume listening without tearing down audio capture. Returns the new state.
@@ -1563,7 +1818,11 @@ function setPushToTalk(active) {
         sendToRenderer('update-status', '🎤 Listening — speak your question, then press the key again');
     } else {
         console.log('[Claude] Push-to-talk: sending question');
-        const hadSpeech = transcriber.flush();
+        // Drains the mic buffer but labels the result MIC_ASK_SOURCE, so this
+        // one utterance is asked as a question instead of filed as the user's
+        // own speech. The intent travels with the job, so it holds however long
+        // transcription takes.
+        const hadSpeech = transcriber.flush('mic', { asSource: MIC_ASK_SOURCE });
         isAudioMuted = muteStateBeforePushToTalk;
         sendToRenderer('audio-muted-toggled', isAudioMuted);
         sendToRenderer('update-status', hadSpeech ? 'Transcribing your question...' : 'No speech detected — speak louder or closer to the mic');
@@ -1589,7 +1848,7 @@ function retryWithFreshSession(result) {
 // user's question — the expand prompt itself — pass null to keep the original.
 // detailed: lift the API-mode token cap (expansions, structured design turns).
 async function sendClaudeText(text, { recordAsQuestion = text, detailed = false } = {}) {
-    if (!isClaudeActive) {
+    if (!isClaudeActive && claudeMode !== 'cli') {
         return { success: false, error: 'No active Claude session' };
     }
 
@@ -1604,7 +1863,7 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
     // this turn only. Detection runs on the clean question (recordAsQuestion
     // for wrapped prompts like answerWithContext); the injected rules are
     // never saved or recorded — they are instructions, not conversation.
-    const questionText = recordAsQuestion === null ? null : (recordAsQuestion || trimmed);
+    const questionText = recordAsQuestion === null ? null : recordAsQuestion || trimmed;
     const isDesignTurn = !!(questionText && isSystemDesignQuestion(questionText));
     if (isDesignTurn) console.log('[Claude] System design question detected — structured answer mode');
     const outgoing = isDesignTurn ? SYSTEM_DESIGN_TURN_RULES + '\n\n' + trimmed : trimmed;
@@ -1633,7 +1892,11 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
             }
         }
         if (result.success && result.text) {
-            saveConversationTurn(trimmed, result.text);
+            // Persist the clean question, never the wrapper. `trimmed` may carry
+            // the user's-own-speech context block or a manual-override preamble;
+            // the saved history and the History view want what was actually asked.
+            saveConversationTurn(questionText || trimmed, result.text);
+            lastAnswerText = result.text;
             if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
         sendToRenderer('response-complete'); // reveal the finished answer in the UI
@@ -1658,7 +1921,8 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
 
         if (fullText.trim()) {
             claudeConversationHistory.push({ role: 'assistant', content: fullText.trim() });
-            saveConversationTurn(trimmed, fullText);
+            saveConversationTurn(questionText || trimmed, fullText);
+            lastAnswerText = fullText.trim();
             if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
 
@@ -1762,6 +2026,9 @@ function closeClaudeSession() {
     }
     pendingTranscripts = [];
     recentHeardTranscripts = [];
+    unsentUserSpeech = [];
+    recentSpeakerSpeech = [];
+    lastAnswerText = '';
     lastAnsweredQuestion = null;
     isTranscriptResponseInFlight = false;
     lastSentTranscriptTurn = null;
@@ -1807,6 +2074,7 @@ module.exports = {
     expandLastAnswer,
     closeClaudeSession,
     isClaudeSessionActive,
+    isClaudeActiveState: isClaudeSessionActive,
 };
 
 // Test seam. The transports cross process/SDK boundaries that unit tests must
@@ -1818,6 +2086,14 @@ module.exports._testing = {
     isSystemDesignQuestion,
     nextFlushDelay,
     whisperContextPromptForProfile,
+    routeTranscript,
+    recordUserSpeech,
+    rememberSpeakerSpeech,
+    looksLikeEcho,
+    peekUserSpeechContext,
+    clearUserSpeechContext,
+    withUserSpeechContext,
+    MIC_ASK_SOURCE,
     runClaudeCli,
     classifyCliFailure,
     queueTranscript,
@@ -1842,6 +2118,7 @@ module.exports._testing = {
             isTransportReady,
             isTranscriptResponseInFlight,
             pendingCount: pendingTranscripts.length,
+            unsentUserSpeechCount: unsentUserSpeech.length,
             persistentAlive: !!persistentProc,
             persistentDisabled,
         };

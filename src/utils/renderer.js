@@ -166,7 +166,7 @@ async function initializeLocal(profile = 'interview') {
     const prefs = await storage.getPreferences();
     const ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
     const ollamaModel = prefs.ollamaModel || 'llama3.1';
-    const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
+    const whisperModel = prefs.whisperModel || 'onnx-community/whisper-large-v3-turbo';
     const customPrompt = resolveCustomPrompt(prefs, profile);
 
     const success = await ipcRenderer.invoke('initialize-local', ollamaHost, ollamaModel, whisperModel, profile, customPrompt);
@@ -184,7 +184,7 @@ async function initializeClaude(profile = 'interview') {
     const creds = await storage.getCredentials();
     const claudeMode = prefs.claudeMode || 'cli';
     const claudeModel = prefs.claudeModel || 'claude-haiku-4-5-20251001';
-    const whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
+    const whisperModel = prefs.whisperModel || 'onnx-community/whisper-large-v3-turbo';
     const customPrompt = resolveCustomPrompt(prefs, profile);
 
     const success = await ipcRenderer.invoke(
@@ -248,7 +248,7 @@ async function startMicCapture() {
             video: false,
         });
         micMediaStream = micStream;
-        setupLinuxMicProcessing(micStream);
+        setupMicProcessing(micStream);
         console.log('Microphone capture started');
         return true;
     } catch (micError) {
@@ -284,10 +284,13 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
             console.log('Starting macOS capture with SystemAudioDump...');
 
-            // Start macOS audio capture
-            const audioResult = await ipcRenderer.invoke('start-macos-audio');
-            if (!audioResult.success) {
-                throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+            // Start macOS system audio capture — skipped in mic_only, where the
+            // whole point is that the other side is not captured.
+            if (audioMode !== 'mic_only') {
+                const audioResult = await ipcRenderer.invoke('start-macos-audio');
+                if (!audioResult.success) {
+                    throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+                }
             }
 
             // Get screen capture for screenshots
@@ -302,9 +305,8 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
             console.log('macOS screen capture started - audio handled by SystemAudioDump');
 
-            // Mic is push-to-talk only: it stays off until the user presses
-            // push-to-talk, then is released again. It is never opened
-            // continuously at session start, regardless of audio mode.
+            // SystemAudioDump covers the other side of the call. The mic, if the
+            // audio mode calls for it, is opened by the shared block below.
         } else if (isLinux) {
             // Linux - use display media for screen capture and try to get system audio
             try {
@@ -326,8 +328,12 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
                 console.log('Linux system audio capture via getDisplayMedia succeeded');
 
-                // Setup audio processing for Linux system audio
-                setupLinuxSystemAudioProcessing();
+                // Setup audio processing for Linux system audio. Skipped in
+                // mic_only: the track is captured with the screen but must not
+                // be transcribed, since only the user's voice is wanted.
+                if (audioMode !== 'mic_only') {
+                    setupLinuxSystemAudioProcessing();
+                }
             } catch (systemAudioError) {
                 console.warn('System audio via getDisplayMedia failed, trying screen-only capture:', systemAudioError);
 
@@ -363,10 +369,32 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
             console.log('Windows capture started with loopback audio');
 
-            // Setup audio processing for Windows loopback audio only
-            setupWindowsLoopbackProcessing();
+            // Setup audio processing for Windows loopback audio only. Skipped in
+            // mic_only: the loopback track rides along with the screen capture
+            // but must not be transcribed.
+            if (audioMode !== 'mic_only') {
+                setupWindowsLoopbackProcessing();
+            }
 
             // Mic is push-to-talk only: not opened continuously here.
+        }
+
+        // Audio modes that include the user's own voice open the mic for the
+        // whole session, on every platform. The main process transcribes it on
+        // a separate stream and treats it as context — what the user already
+        // said out loud — rather than as a question to answer. Push-to-talk
+        // still works on top of this: it sees the mic already running and
+        // leaves it running afterwards (pushToTalkStartedMic).
+        if (audioMode === 'both' || audioMode === 'mic_only') {
+            const micOk = await startMicCapture();
+            if (micOk) {
+                console.log(`Continuous microphone capture started for audio mode "${audioMode}"`);
+            } else {
+                // Non-fatal: system audio still works, so the session is usable —
+                // the user just loses the "what I already said" context.
+                console.warn('Continuous microphone capture failed — continuing with system audio only');
+                cheatingDaddy.setStatus('Microphone unavailable — your own speech will not be captured');
+            }
         }
 
         console.log('MediaStream obtained:', {
@@ -389,8 +417,9 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
     }
 }
 
-function setupLinuxMicProcessing(micStream) {
-    // Setup microphone audio processing for Linux
+function setupMicProcessing(micStream) {
+    // Microphone capture, used on every platform (continuous when the audio
+    // mode includes the user's voice, otherwise only during push-to-talk).
     const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
     const micSource = micAudioContext.createMediaStreamSource(micStream);
     const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);

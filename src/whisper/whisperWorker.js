@@ -70,7 +70,11 @@ async function transcribe(audio, samplingRate, language) {
     // no_repeat_ngram_size matches the CPU path: it is the primary guard against
     // the decoder falling into a "this is this is this is…" loop, which shows up
     // most on short/silence-padded audio and on non-English speech.
-    const options = { sampling_rate: samplingRate || 16000, no_repeat_ngram_size: 3 };
+    const options = {
+        sampling_rate: samplingRate || 16000,
+        no_repeat_ngram_size: 3,
+        condition_on_previous_text: false,
+    };
     if (!isEnglishOnly(activeModelName)) {
         options.language = language || 'en';
         options.task = 'transcribe';

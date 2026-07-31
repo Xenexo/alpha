@@ -75,9 +75,12 @@ export class AICustomizeView extends LitElement {
         }
     }
 
-    _handleProfileChange(e) {
-        this.selectedProfile = e.target.value;
-        this.onProfileChange(e.target.value);
+    async _handleProfileChange(e) {
+        const val = e.target.value;
+        this.selectedProfile = val;
+        this.onProfileChange(val);
+        await cheatingDaddy.storage.updatePreference('selectedProfile', val);
+        this.requestUpdate();
     }
 
     async _saveContext(val) {
@@ -139,7 +142,6 @@ export class AICustomizeView extends LitElement {
                             </div>
                         </div>
                     </section>
-
                 </div>
             </div>
         `;

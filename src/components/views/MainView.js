@@ -548,7 +548,7 @@ export class MainView extends LitElement {
         this._showLocalHelp = false;
         this._ollamaHost = 'http://127.0.0.1:11434';
         this._ollamaModel = 'llama3.1';
-        this._whisperModel = 'Xenova/whisper-tiny';
+        this._whisperModel = 'onnx-community/whisper-large-v3-turbo';
         this._whisperLanguage = 'en';
         this._claudeMode = 'cli';
         this._anthropicKey = '';
@@ -576,6 +576,7 @@ export class MainView extends LitElement {
 
             const storedMode = prefs.providerMode || 'byok';
             this._mode = storedMode === 'cloud' ? 'byok' : storedMode;
+            this.selectedProfile = prefs.selectedProfile || 'interview';
 
             if (storedMode === 'cloud') {
                 await cheatingDaddy.storage.updatePreference('providerMode', this._mode);
@@ -590,7 +591,7 @@ export class MainView extends LitElement {
             // Load local AI settings
             this._ollamaHost = prefs.ollamaHost || 'http://127.0.0.1:11434';
             this._ollamaModel = prefs.ollamaModel || 'llama3.1';
-            this._whisperModel = prefs.whisperModel || 'Xenova/whisper-tiny';
+            this._whisperModel = prefs.whisperModel || 'onnx-community/whisper-large-v3-turbo';
             this._whisperLanguage = prefs.whisperLanguage || 'en';
 
             // Load Claude settings
@@ -868,8 +869,37 @@ export class MainView extends LitElement {
         }
     }
 
+    async _saveProfile(profile) {
+        this.selectedProfile = profile;
+        this.onProfileChange(profile);
+        await cheatingDaddy.storage.updatePreference('selectedProfile', profile);
+        this.requestUpdate();
+    }
+
     _handleProfileChange(e) {
-        this.onProfileChange(e.target.value);
+        this._saveProfile(e.target.value);
+    }
+
+    _renderProfileSelect() {
+        const profiles = [
+            { value: 'interview', label: 'Job Interview' },
+            { value: 'relationship', label: 'Relationship' },
+            { value: 'sales', label: 'Sales Call' },
+            { value: 'meeting', label: 'Business Meeting' },
+            { value: 'presentation', label: 'Presentation' },
+            { value: 'negotiation', label: 'Negotiation' },
+            { value: 'exam', label: 'Exam Assistant' },
+            { value: 'mcq', label: 'MCQ (Short Answer)' },
+        ];
+        return html`
+            <div class="form-group">
+                <label class="form-label">Profile / Scenario</label>
+                <select .value=${this.selectedProfile} @change=${e => this._saveProfile(e.target.value)}>
+                    ${profiles.map(p => html`<option value=${p.value} ?selected=${this.selectedProfile === p.value}>${p.label}</option>`)}
+                </select>
+                <div class="form-hint">Tailors AI response style and advice for your active conversation mode</div>
+            </div>
+        `;
     }
 
     // ── Start ──
@@ -1010,7 +1040,7 @@ export class MainView extends LitElement {
                 </div>
             </div>
 
-            ${this._renderStartButton()} ${this._renderDivider()}
+            ${this._renderProfileSelect()} ${this._renderStartButton()} ${this._renderDivider()}
 
             <!-- Cloud promo intentionally removed from the active UI. -->
 
@@ -1160,7 +1190,7 @@ export class MainView extends LitElement {
                 </select>
             </div>
 
-            ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
+            ${this._renderProfileSelect()} ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
 
             <div class="mode-links">
                 <button class="mode-link" @click=${() => this._saveMode('byok')}>Use own API keys</button>
@@ -1216,7 +1246,7 @@ export class MainView extends LitElement {
                 </div>
             </div>
 
-            ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
+            ${this._renderProfileSelect()} ${this._renderWhisperSelect()} ${this._renderStartButton()} ${this._renderDivider()}
 
             <!-- Cloud promo intentionally removed from the active UI. -->
 
@@ -1250,8 +1280,8 @@ export class MainView extends LitElement {
                                   <button
                                       class="help-btn"
                                       @click=${() => {
-                                      this._showLocalHelp = !this._showLocalHelp;
-                                  }}
+                                          this._showLocalHelp = !this._showLocalHelp;
+                                      }}
                                   >
                                       ${this._showLocalHelp ? closeIcon : helpIcon}
                                   </button>

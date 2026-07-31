@@ -773,9 +773,10 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             if (currentProviderMode === 'cloud') {
                 sendCloudAudio(monoChunk);
             } else if (currentProviderMode === 'local') {
-                getLocalAi().processLocalAudio(monoChunk);
+                // SystemAudioDump is macOS system audio — the other person, never the mic.
+                getLocalAi().processLocalAudio(monoChunk, 'speaker');
             } else if (currentProviderMode === 'claude') {
-                getClaude().processClaudeAudio(monoChunk);
+                getClaude().processClaudeAudio(monoChunk, 'speaker');
             } else {
                 const base64Data = monoChunk.toString('base64');
                 sendAudioToGemini(base64Data, geminiSessionRef);
@@ -993,7 +994,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, 'speaker');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local audio:', error);
@@ -1003,7 +1004,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'claude') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getClaude().processClaudeAudio(pcmBuffer);
+                getClaude().processClaudeAudio(pcmBuffer, 'speaker');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending claude audio:', error);
@@ -1038,7 +1039,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, 'mic');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local mic audio:', error);
@@ -1048,7 +1049,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'claude') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getClaude().processClaudeAudio(pcmBuffer);
+                getClaude().processClaudeAudio(pcmBuffer, 'mic');
                 return { success: true };
             } catch (error) {
                 console.error('Error sending claude mic audio:', error);
@@ -1191,6 +1192,160 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             console.error('Error expanding answer:', error);
             return { success: false, error: error.message };
         }
+    });
+
+    // Generate executive summary for a session history
+    ipcMain.handle('summarize-session', async (event, sessionData) => {
+        if (!sessionData) return { success: false, error: 'No session data provided' };
+
+        const conversationText = [];
+        const profile = sessionData.profile || 'Session';
+        const dateStr = sessionData.createdAt ? new Date(sessionData.createdAt).toLocaleString() : 'Recent';
+
+        if (sessionData.conversationHistory && sessionData.conversationHistory.length > 0) {
+            sessionData.conversationHistory.forEach(turn => {
+                if (turn.transcription) conversationText.push(`[Speaker/User]: ${turn.transcription}`);
+                if (turn.ai_response) conversationText.push(`[AI Assistant]: ${turn.ai_response}`);
+            });
+        }
+
+        if (sessionData.screenAnalysisHistory && sessionData.screenAnalysisHistory.length > 0) {
+            sessionData.screenAnalysisHistory.forEach((entry, idx) => {
+                if (entry.response) conversationText.push(`[Screen Analysis ${idx + 1}]: ${entry.response}`);
+            });
+        }
+
+        if (conversationText.length === 0) {
+            return { success: false, error: 'Session has no conversation or screen analysis data to summarize.' };
+        }
+
+        const isAiRefusal = text =>
+            !text || /outside my core function|Claude Code|software engineering assistant|career coach|mock interview transcript/i.test(text);
+
+        const prompt =
+            `Analyze the following conversation transcript log from a ${profile} session (${dateStr}).\n\n` +
+            `Summarize the key points and decisions in Markdown using these sections:\n\n` +
+            `📌 **Executive Overview**\n` +
+            `[High-level 2-3 sentence overview of the conversation]\n\n` +
+            `🔑 **Key Discussion Highlights**\n` +
+            `• [Key topic / discussion point 1]\n` +
+            `• [Key topic / discussion point 2]\n\n` +
+            `✅ **Decisions & Action Items**\n` +
+            `• [Decision or action item 1]\n` +
+            `• [Decision or action item 2]\n\n` +
+            `Transcript Log:\n` +
+            conversationText.join('\n\n');
+
+        // Retrieve stored API credentials for BYOK mode
+        let creds = {};
+        try {
+            creds = await storage.getCredentials();
+        } catch (e) {}
+
+        // 1. Try Anthropic API Key (BYOK)
+        if (creds && creds.anthropicApiKey && creds.anthropicApiKey.trim()) {
+            try {
+                const Anthropic = require('@anthropic-ai/sdk');
+                const client = new Anthropic({ apiKey: creds.anthropicApiKey.trim() });
+                const response = await client.messages.create({
+                    model: 'claude-3-5-haiku-20241022',
+                    max_tokens: 1500,
+                    messages: [{ role: 'user', content: prompt }],
+                });
+                const text = response.content?.[0]?.text || '';
+                if (text && !isAiRefusal(text)) return { success: true, text };
+            } catch (err) {
+                console.warn('[Summary] Anthropic API key request failed:', err.message);
+            }
+        }
+
+        // 2. Try Gemini API Key (BYOK)
+        if (creds && creds.apiKey && creds.apiKey.trim()) {
+            try {
+                const { GoogleGenAI } = require('@google/genai');
+                const ai = new GoogleGenAI({ apiKey: creds.apiKey.trim() });
+                let text = '';
+                try {
+                    const response = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash',
+                        contents: prompt,
+                    });
+                    text = response.text || '';
+                } catch (e1) {
+                    const response = await ai.models.generateContent({
+                        model: 'gemini-1.5-flash',
+                        contents: prompt,
+                    });
+                    text = response.text || '';
+                }
+                if (text && !isAiRefusal(text)) return { success: true, text };
+            } catch (err) {
+                console.warn('[Summary] Gemini API key request failed:', err.message);
+            }
+        }
+
+        // 3. Try Groq API Key (BYOK)
+        if (creds && creds.groqApiKey && creds.groqApiKey.trim()) {
+            try {
+                const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${creds.groqApiKey.trim()}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        model: 'llama-3.3-70b-versatile',
+                        messages: [{ role: 'user', content: prompt }],
+                    }),
+                });
+                const data = await response.json();
+                const text = data.choices?.[0]?.message?.content || '';
+                if (text && !isAiRefusal(text)) return { success: true, text };
+            } catch (err) {
+                console.warn('[Summary] Groq API key request failed:', err.message);
+            }
+        }
+
+        // 4. Claude Mode (CLI / Session)
+        const claude = getClaude();
+        if (currentProviderMode === 'claude' || (claude && typeof claude.isClaudeSessionActive === 'function' && claude.isClaudeSessionActive())) {
+            try {
+                const res = await claude.sendClaudeText(prompt, { detailed: true });
+                if (res && res.success && res.text && !isAiRefusal(res.text)) return res;
+            } catch (err) {
+                console.warn('[Summary] Claude CLI request failed:', err.message);
+            }
+        }
+
+        // 5. Local Ollama Mode
+        if (currentProviderMode === 'local') {
+            try {
+                const res = await getLocalAi().sendLocalText(prompt);
+                if (res && res.success && res.text && !isAiRefusal(res.text)) return res;
+            } catch (err) {
+                console.warn('[Summary] Local AI request failed:', err.message);
+            }
+        }
+
+        // 6. Last-ditch attempt via Claude CLI
+        try {
+            const res = await getClaude().sendClaudeText(prompt, { detailed: true });
+            if (res && res.success && res.text && !isAiRefusal(res.text)) return res;
+        } catch (err) {}
+
+        // 7. Instant Structured Summary Fallback (offline / no API key configured)
+        const summaryHighlights = conversationText.slice(-6).map(line => `• ${line}`);
+        const fallbackSummary =
+            `📌 **Executive Overview**\n` +
+            `Session summary for ${profile} (${dateStr}) containing ${conversationText.length} interaction turns.\n\n` +
+            `🔑 **Key Discussion Highlights**\n` +
+            (summaryHighlights.length > 0 ? summaryHighlights.join('\n') : '• No transcript turns recorded in session.') +
+            `\n\n` +
+            `✅ **Decisions & Action Items**\n` +
+            `• Review key conversation highlights above.\n` +
+            `• Enter an Anthropic, Gemini, or Groq API key in Settings for AI-synthesized summaries.`;
+
+        return { success: true, text: fallbackSummary };
     });
 
     ipcMain.handle('start-macos-audio', async event => {

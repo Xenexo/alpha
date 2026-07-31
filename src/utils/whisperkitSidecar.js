@@ -176,11 +176,11 @@ function encodeWav(float32Audio, sampleRate) {
 function postTranscription(wavBuffer, language = 'en') {
     return new Promise((resolve, reject) => {
         const boundary = '----WhisperKitSidecar' + Math.random().toString(36).slice(2);
-        const part = name => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n`;
+        const part = (name, val) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${val}\r\n`;
         const body = Buffer.concat([
-            Buffer.from(part('model') + servedModel + '\r\n'),
-            Buffer.from(part('language') + language + '\r\n'),
-            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n` + 'Content-Type: audio/wav\r\n\r\n'),
+            Buffer.from(part('model', servedModel || '')),
+            Buffer.from(part('language', language)),
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n`),
             wavBuffer,
             Buffer.from(`\r\n--${boundary}--\r\n`),
         ]);

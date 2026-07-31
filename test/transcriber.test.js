@@ -2,6 +2,9 @@
 // start promptly (~0.8s of speech), never launch on a silence frame (the
 // imminent final would queue behind them), and retry on the next frame after a
 // busy-pipeline skip instead of stalling a whole interval.
+//
+// Plus per-source stream isolation: speaker (the other person) and mic (the
+// user) audio share one Whisper model but must never share VAD state.
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
@@ -51,8 +54,8 @@ function frame(value) {
 const voice = () => frame(8000);
 const silence = () => frame(0);
 
-function feed(frames) {
-    for (const f of frames) transcriber.processAudio24k(f);
+function feed(frames, source) {
+    for (const f of frames) transcriber.processAudio24k(f, source);
 }
 const repeat = (make, n) => Array.from({ length: n }, make);
 
@@ -64,6 +67,8 @@ async function tick() {
 }
 
 const interimEvents = () => sentEvents.filter(e => e.channel === 'interim-transcript');
+// Interim payloads are { text, source } so the UI can label whose speech it is.
+const interimTexts = () => interimEvents().map(e => e.payload.text);
 
 // Backend loads once ('ane' via the fake sidecar) and persists across tests.
 const ready = transcriber.initWhisper('onnx-community/whisper-large-v3-turbo');
@@ -93,10 +98,8 @@ test('first interim fires after ~0.8s of speech, not 1.5s', async () => {
     feed(repeat(voice, 1));
     await tick();
     assert.equal(transcribeCalls, 1, 'interim fires as soon as the interval is reached');
-    assert.deepEqual(
-        interimEvents().map(e => e.payload),
-        ['hello world']
-    );
+    assert.deepEqual(interimTexts(), ['hello world']);
+    assert.equal(interimEvents()[0].payload.source, 'speaker');
 });
 
 test('silence frames never launch an interim, and the final still goes through', async () => {
@@ -153,8 +156,114 @@ test('a busy-pipeline skip retries on the next frame instead of waiting out a ne
     feed(repeat(voice, 1));
     await tick();
     assert.equal(transcribeCalls, 2, 'next frame after unblock fires the next interim');
-    assert.deepEqual(
-        interimEvents().map(e => e.payload),
-        ['partial one', 'partial two']
-    );
+    assert.deepEqual(interimTexts(), ['partial one', 'partial two']);
+});
+
+// ── Per-source streams ──
+//
+// Speaker (the other person) and mic (the user) audio arrive interleaved and
+// must be kept in separate VAD/utterance state. Sharing it would splice two
+// people's sentences into one transcript and break end-of-utterance detection.
+
+// Silence long enough for the VAD to end an utterance (BALANCED needs 5).
+const END_OF_UTTERANCE = 8;
+
+function collectTranscripts() {
+    const got = [];
+    transcriber.setOnTranscript((text, meta = {}) => {
+        got.push({ text, source: meta.source });
+    });
+    return got;
+}
+
+test('interleaved speaker and mic frames produce separate, labelled transcripts', async () => {
+    transcriber.resetTranscriber();
+    sentEvents.length = 0;
+    transcribeCalls = 0;
+    const got = collectTranscripts();
+    transcribeImpl = async () => 'hello world';
+
+    // Both talk at once, frame-interleaved — the worst case for shared VAD state.
+    for (let i = 0; i < 12; i++) {
+        transcriber.processAudio24k(voice(), 'speaker');
+        transcriber.processAudio24k(voice(), 'mic');
+    }
+    for (let i = 0; i < END_OF_UTTERANCE; i++) {
+        transcriber.processAudio24k(silence(), 'speaker');
+        transcriber.processAudio24k(silence(), 'mic');
+    }
+    await tick();
+    await tick();
+
+    assert.deepEqual(got.map(t => t.source).sort(), ['mic', 'speaker'], 'each source must yield exactly one transcript, tagged with its own source');
+});
+
+test('a source with no audio never produces a transcript', async () => {
+    transcriber.resetTranscriber();
+    transcribeCalls = 0;
+    const got = collectTranscripts();
+    transcribeImpl = async () => 'only the speaker talked';
+
+    feed([...repeat(silence, 3), ...repeat(voice, 12), ...repeat(silence, END_OF_UTTERANCE)], 'speaker');
+    await tick();
+    await tick();
+
+    assert.equal(got.length, 1);
+    assert.equal(got[0].source, 'speaker');
+});
+
+test('processAudio24k defaults to the speaker source', async () => {
+    transcriber.resetTranscriber();
+    transcribeCalls = 0;
+    const got = collectTranscripts();
+    transcribeImpl = async () => 'unlabelled caller';
+
+    // No source argument — the pre-existing single-stream call shape.
+    feed([...repeat(silence, 3), ...repeat(voice, 12), ...repeat(silence, END_OF_UTTERANCE)]);
+    await tick();
+    await tick();
+
+    assert.equal(got.length, 1);
+    assert.equal(got[0].source, 'speaker', 'legacy callers must keep behaving as the interviewer stream');
+});
+
+test('flush({ asSource }) relabels the flushed mic audio without touching the speaker stream', async () => {
+    transcriber.resetTranscriber();
+    transcribeCalls = 0;
+    const got = collectTranscripts();
+    transcribeImpl = async () => 'my question for claude';
+
+    // Push-to-talk: the user speaks into the mic and releases before the VAD
+    // has seen end-of-utterance silence.
+    feed([...repeat(silence, 3), ...repeat(voice, 12)], 'mic');
+    const hadSpeech = transcriber.flush('mic', { asSource: 'mic-ask' });
+    await tick();
+    await tick();
+
+    assert.equal(hadSpeech, true);
+    assert.equal(got.length, 1);
+    assert.equal(got[0].source, 'mic-ask', 'push-to-talk audio must be answerable, not filed as context');
+});
+
+test('flush on an idle source reports no speech and queues nothing', async () => {
+    transcriber.resetTranscriber();
+    transcribeCalls = 0;
+    collectTranscripts();
+
+    assert.equal(transcriber.flush('mic'), false);
+    await tick();
+    assert.equal(transcribeCalls, 0);
+});
+
+test('isPipelineBusy can be scoped to one source', async () => {
+    transcriber.resetTranscriber();
+    transcribeCalls = 0;
+    collectTranscripts();
+
+    // Only the mic is mid-utterance.
+    feed([...repeat(silence, 3), ...repeat(voice, 4)], 'mic');
+
+    assert.equal(transcriber.isPipelineBusy('mic'), true);
+    assert.equal(transcriber.isPipelineBusy('speaker'), false, 'the other person is not talking');
+    assert.equal(transcriber.isPipelineBusy(), true, 'unscoped means "any source"');
 });

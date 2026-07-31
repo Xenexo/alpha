@@ -13,8 +13,7 @@ function sendToRenderer(channel, data) {
     // Exclude the hidden Whisper worker window (whisper-worker.html) — it has no
     // UI and getAllWindows() order is not guaranteed, so [0] is unreliable.
     const windows = BrowserWindow.getAllWindows();
-    const win =
-        windows.find(w => !w.isDestroyed() && !w.webContents.getURL().includes('whisper-worker')) || windows[0];
+    const win = windows.find(w => !w.isDestroyed() && !w.webContents.getURL().includes('whisper-worker')) || windows[0];
     if (win && !win.isDestroyed()) {
         win.webContents.send(channel, data);
     }
@@ -27,7 +26,9 @@ function setOnTurnComplete(callback) {
 function connectCloud(token, profile, userContext) {
     // Close existing connection
     if (cloudWs) {
-        try { cloudWs.close(); } catch (e) {}
+        try {
+            cloudWs.close();
+        } catch (e) {}
         cloudWs = null;
         isCloudConnected = false;
     }
@@ -56,7 +57,7 @@ function connectCloud(token, profile, userContext) {
             const config = JSON.stringify({
                 type: 'set_config',
                 profile: profile || 'interview',
-                user_context: userContext || ''
+                user_context: userContext || '',
             });
             cloudWs.send(config);
             console.log('[Cloud] Config sent:', profile);
@@ -65,7 +66,7 @@ function connectCloud(token, profile, userContext) {
             resolve(true);
         });
 
-        cloudWs.on('message', (data) => {
+        cloudWs.on('message', data => {
             try {
                 const msg = JSON.parse(data.toString());
                 handleMessage(msg);
@@ -81,7 +82,7 @@ function connectCloud(token, profile, userContext) {
             clearTimeout(timeout);
         });
 
-        cloudWs.on('error', (err) => {
+        cloudWs.on('error', err => {
             console.error('[Cloud] WebSocket error:', err.message);
             isCloudConnected = false;
             clearTimeout(timeout);
@@ -141,7 +142,7 @@ function sendCloudAudio(pcmBuffer) {
         return;
     }
 
-    cloudWs.send(pcmBuffer, { binary: true }, (err) => {
+    cloudWs.send(pcmBuffer, { binary: true }, err => {
         if (err) {
             console.error('[Cloud] Audio send error:', err.message);
         }
@@ -153,10 +154,12 @@ function sendCloudAudio(pcmBuffer) {
 
 function sendCloudText(text) {
     if (cloudWs && isCloudConnected && cloudWs.readyState === WebSocket.OPEN) {
-        cloudWs.send(JSON.stringify({
-            type: 'test_text',
-            text: text
-        }));
+        cloudWs.send(
+            JSON.stringify({
+                type: 'test_text',
+                text: text,
+            })
+        );
     }
 }
 
@@ -164,10 +167,12 @@ function sendCloudImage(base64Data) {
     if (!cloudWs || !isCloudConnected || cloudWs.readyState !== WebSocket.OPEN) {
         return false;
     }
-    cloudWs.send(JSON.stringify({
-        type: 'image',
-        image: base64Data
-    }));
+    cloudWs.send(
+        JSON.stringify({
+            type: 'image',
+            image: base64Data,
+        })
+    );
     return true;
 }
 

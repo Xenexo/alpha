@@ -46,12 +46,12 @@ is spawned.
 `'byok' | 'cloud' | 'local' | 'claude'`), session/history bookkeeping, macOS `SystemAudioDump`
 capture, and `sendToRenderer`. Every audio/text/image entry point branches on the mode and delegates:
 
-| mode    | module                 | transport                                              |
-| ------- | ---------------------- | ------------------------------------------------------ |
-| `byok`  | `utils/gemini.js`      | Google GenAI live session with the user's key          |
-| `cloud` | `utils/cloud.js`       | WebSocket to `api.cheatingdaddy.com`                   |
-| `local` | `utils/localai.js`     | Ollama                                                 |
-| `claude`| `utils/claude.js`      | Claude Code CLI (persistent), CLI one-shot, SDK, or API |
+| mode     | module             | transport                                               |
+| -------- | ------------------ | ------------------------------------------------------- |
+| `byok`   | `utils/gemini.js`  | Google GenAI live session with the user's key           |
+| `cloud`  | `utils/cloud.js`   | WebSocket to `api.cheatingdaddy.com`                    |
+| `local`  | `utils/localai.js` | Ollama                                                  |
+| `claude` | `utils/claude.js`  | Claude Code CLI (persistent), CLI one-shot, SDK, or API |
 
 `claude.js` and `localai.js` import from `gemini.js` and `gemini.js` lazily `require()`s them back —
 the getter functions (`getClaude()`, `getLocalAi()`) exist to break that cycle. Keep new
@@ -100,7 +100,7 @@ views live in `src/components/views/`. Note that `src/components/index.js` is st
 ## Conventions
 
 - Four-space indent, single quotes, semicolons, 150-column width — enforced only by Prettier.
-- Comments in this codebase explain *why*, often at length, especially around timing, fallback order,
+- Comments in this codebase explain _why_, often at length, especially around timing, fallback order,
   and Electron/OS quirks. Match that: if a constant or ordering is load-bearing, say why it is.
 - Modules keep state in file-level closures and export a small `// ── Public API ──` block at the bottom.
 - IPC channels are namespaced with a colon (`storage:get-config`, `whisper:transcribe`).

@@ -13,6 +13,39 @@ let isLocalActive = false;
 let isAudioMuted = false;
 let muteStateBeforePushToTalk = false;
 
+// Speech from the 'mic' source is the user talking, not a question for the
+// model. It never triggers a reply — it accumulates here and is attached as
+// labelled context to the next question from the other person, so the answer
+// continues from what the user already said. Mirrors claude.js; see the longer
+// rationale there.
+let unsentUserSpeech = [];
+const USER_SPEECH_MAX = 12;
+const USER_SPEECH_CONTEXT_CHARS = 1200;
+// Push-to-talk audio: physically the mic, but deliberately addressed to the
+// model, so it is answered instead of recorded as context.
+const MIC_ASK_SOURCE = 'mic-ask';
+
+function recordUserSpeech(text) {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return;
+    unsentUserSpeech.push(trimmed);
+    if (unsentUserSpeech.length > USER_SPEECH_MAX) {
+        unsentUserSpeech = unsentUserSpeech.slice(-USER_SPEECH_MAX);
+    }
+    console.log('[LocalAI] Recorded your speech as context (not answering):', trimmed.substring(0, 80));
+    sendToRenderer('user-transcript', trimmed);
+}
+
+// Consumed as the question is built: Ollama keeps localConversationHistory, so
+// the block only needs to be stated once.
+function takeUserSpeechContext() {
+    if (unsentUserSpeech.length === 0) return '';
+    const speech = unsentUserSpeech.join(' ').replace(/\s+/g, ' ').trim();
+    unsentUserSpeech = [];
+    if (!speech) return '';
+    return speech.length > USER_SPEECH_CONTEXT_CHARS ? '…' + speech.slice(-USER_SPEECH_CONTEXT_CHARS) : speech;
+}
+
 // ── Ollama Chat ──
 
 async function sendToOllama(transcription) {
@@ -23,9 +56,18 @@ async function sendToOllama(transcription) {
 
     console.log('[LocalAI] Sending to Ollama:', transcription.substring(0, 100) + '...');
 
+    // Attach whatever the user said out loud since the last turn, labelled so
+    // the model answers only the incoming question but continues from where the
+    // user left off instead of repeating them.
+    const userSpeech = takeUserSpeechContext();
+    const content = userSpeech
+        ? `[WHAT I ALREADY SAID OUT LOUD — CONTEXT ONLY, DO NOT ANSWER OR REPLY TO THIS]\n"${userSpeech}"\n\n` +
+          `[THE OTHER PERSON JUST ASKED — ANSWER ONLY THIS]\n${transcription.trim()}`
+        : transcription.trim();
+
     localConversationHistory.push({
         role: 'user',
-        content: transcription.trim(),
+        content,
     });
 
     // Keep history manageable
@@ -34,10 +76,7 @@ async function sendToOllama(transcription) {
     }
 
     try {
-        const messages = [
-            { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
-            ...localConversationHistory,
-        ];
+        const messages = [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...localConversationHistory];
 
         const response = await ollamaClient.chat({
             model: ollamaModel,
@@ -109,13 +148,21 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
 
         // Reset transcriber state and route transcripts to Ollama
         transcriber.resetTranscriber();
-        transcriber.setOnTranscript(async transcription => {
+        transcriber.setOnTranscript(async (transcription, { source } = {}) => {
             if (!isLocalActive) return;
+            // The user's own voice is context, not a question — it rides along
+            // with the next question instead of triggering its own answer.
+            // Push-to-talk audio arrives tagged MIC_ASK_SOURCE and is answered.
+            if (source === 'mic') {
+                recordUserSpeech(transcription);
+                return;
+            }
             sendToRenderer('update-status', 'Generating response...');
             await sendToOllama(transcription);
         });
 
         localConversationHistory = [];
+        unsentUserSpeech = [];
 
         // Initialize conversation session
         initializeNewSession(profile, customPrompt);
@@ -134,10 +181,11 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
     }
 }
 
-function processLocalAudio(monoChunk24k) {
+// source: 'speaker' (system audio / the other person) or 'mic' (the user).
+function processLocalAudio(monoChunk24k, source = 'speaker') {
     if (!isLocalActive) return;
     if (isAudioMuted) return; // listening paused — drop the frame, keep capture alive
-    transcriber.processAudio24k(monoChunk24k);
+    transcriber.processAudio24k(monoChunk24k, source);
 }
 
 // Push-to-talk: open the mic gate while listening, then on release
@@ -149,7 +197,9 @@ function setPushToTalk(active) {
         isAudioMuted = false;
         sendToRenderer('update-status', '🎤 Listening — speak your question, then press the key again');
     } else {
-        const hadSpeech = transcriber.flush();
+        // Drains the mic buffer but labels the result as an intentional
+        // question, so it is answered rather than filed as context.
+        const hadSpeech = transcriber.flush('mic', { asSource: MIC_ASK_SOURCE });
         isAudioMuted = muteStateBeforePushToTalk;
         sendToRenderer('audio-muted-toggled', isAudioMuted);
         sendToRenderer('update-status', hadSpeech ? 'Transcribing your question...' : 'No speech detected — speak louder or closer to the mic');
@@ -163,6 +213,7 @@ function closeLocalSession() {
     isAudioMuted = false;
     transcriber.resetTranscriber();
     localConversationHistory = [];
+    unsentUserSpeech = [];
     ollamaClient = null;
     ollamaModel = null;
     currentSystemPrompt = null;

@@ -251,6 +251,18 @@ function getPreferences() {
         writeJsonFile(getPreferencesPath(), saved);
     }
 
+    // Tiny and Base are especially poor at multilingual speech. Upgrade legacy
+    // accuracy settings once so existing installations benefit from the same
+    // Large v3 Turbo default as new ones; users can still choose a smaller
+    // model afterwards when download size or speed matters more.
+    if (!Object.prototype.hasOwnProperty.call(saved, 'whisperAccuracyDefaultApplied')) {
+        if (!saved.whisperModel || ['Xenova/whisper-tiny', 'Xenova/whisper-base'].includes(saved.whisperModel)) {
+            saved.whisperModel = DEFAULT_PREFERENCES.whisperModel;
+        }
+        saved.whisperAccuracyDefaultApplied = true;
+        writeJsonFile(getPreferencesPath(), saved);
+    }
+
     return { ...DEFAULT_PREFERENCES, ...saved };
 }
 

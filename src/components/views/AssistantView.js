@@ -472,6 +472,28 @@ export class AssistantView extends LitElement {
             content: '…';
         }
 
+        /* The user's own speech. Captured as context for the next question and
+           never answered on its own, so it is de-emphasised relative to the
+           other person's lines — which are the ones that produce answers. */
+        .transcript-item.from-you {
+            color: var(--text-muted);
+        }
+
+        .speaker-tag {
+            display: inline-block;
+            margin-right: 6px;
+            padding: 0 5px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            font-weight: var(--font-weight-medium);
+            letter-spacing: var(--tracking-wide);
+            vertical-align: baseline;
+            user-select: none;
+        }
+
         /* ── Bottom input bar ── */
 
         .input-bar {
@@ -656,6 +678,7 @@ export class AssistantView extends LitElement {
         responses: { type: Array },
         transcripts: { type: Array },
         interimTranscript: { type: String },
+        interimTranscriptSource: { type: String },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
@@ -671,6 +694,7 @@ export class AssistantView extends LitElement {
         this.responses = [];
         this.transcripts = [];
         this.interimTranscript = '';
+        this.interimTranscriptSource = 'speaker';
         this.currentResponseIndex = -1;
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
@@ -1064,11 +1088,14 @@ export class AssistantView extends LitElement {
         const hasMultipleResponses = this.responses.length > 1;
         const isOnLatest = this.currentResponseIndex >= this.responses.length - 1;
         const hasTranscripts = (this.transcripts && this.transcripts.length > 0) || this.interimTranscript;
-        const latestHeard = this.interimTranscript
-            ? this.interimTranscript
-            : this.transcripts && this.transcripts.length > 0
-              ? this.transcripts[this.transcripts.length - 1]
-              : '';
+        // Entries are { text, source }, where source is 'speaker' (the other
+        // person, which is what gets answered) or 'user' (the user's own voice,
+        // captured as context only). Tolerate bare strings defensively.
+        const entryText = t => (typeof t === 'string' ? t : t?.text || '');
+        const entrySource = t => (typeof t === 'string' ? 'speaker' : t?.source || 'speaker');
+        const lastEntry = this.transcripts && this.transcripts.length > 0 ? this.transcripts[this.transcripts.length - 1] : null;
+        const latestHeard = this.interimTranscript ? this.interimTranscript : lastEntry ? entryText(lastEntry) : '';
+        const latestSource = this.interimTranscript ? this.interimTranscriptSource || 'speaker' : lastEntry ? entrySource(lastEntry) : 'speaker';
 
         return html`
             <div class="answer-area">
@@ -1108,14 +1135,14 @@ export class AssistantView extends LitElement {
                                       </svg>
                                   </button>
                                   ${
-                            !isOnLatest
-                                ? html`
-                                      <button class="latest-btn" @click=${this.navigateToLatestResponse} title="Jump to the newest answer">
-                                          ${this.isStreaming ? html`<span class="live-dot"></span>` : ''} Latest
-                                      </button>
-                                  `
-                                : ''
-                        }
+                                      !isOnLatest
+                                          ? html`
+                                                <button class="latest-btn" @click=${this.navigateToLatestResponse} title="Jump to the newest answer">
+                                                    ${this.isStreaming ? html`<span class="live-dot"></span>` : ''} Latest
+                                                </button>
+                                            `
+                                          : ''
+                                  }
                               </div>
                           `
                         : ''
@@ -1148,10 +1175,14 @@ export class AssistantView extends LitElement {
                                       Heard
                                   </span>
                                   ${
-                            !this.transcriptsExpanded
-                                ? html` <span class="transcript-current ${this.interimTranscript ? 'interim' : ''}">${latestHeard}</span> `
-                                : html`<span class="transcript-current"></span>`
-                        }
+                                      !this.transcriptsExpanded
+                                          ? html`
+                                                <span class="transcript-current ${this.interimTranscript ? 'interim' : ''}">
+                                                    ${latestSource === 'user' ? html`<span class="speaker-tag you">You</span>` : ''}${latestHeard}
+                                                </span>
+                                            `
+                                          : html`<span class="transcript-current"></span>`
+                                  }
                                   <span class="transcript-toggle">
                                       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
                                           <path
@@ -1163,21 +1194,33 @@ export class AssistantView extends LitElement {
                                   </span>
                               </div>
                               ${
-                        this.transcriptsExpanded
-                            ? html`
-                                  <div class="transcript-history" id="transcriptHistory">
-                                      ${this.transcripts.map(
-                                (t, i) => html`
-                                    <div class="transcript-item ${i === this.transcripts.length - 1 && !this.interimTranscript ? 'latest' : ''}">
-                                        ${t}
-                                    </div>
-                                `
-                            )}
-                                      ${this.interimTranscript ? html` <div class="transcript-item interim">${this.interimTranscript}</div> ` : ''}
-                                  </div>
-                              `
-                            : ''
-                    }
+                                  this.transcriptsExpanded
+                                      ? html`
+                                            <div class="transcript-history" id="transcriptHistory">
+                                                ${this.transcripts.map(
+                                                    (t, i) => html`
+                                                        <div
+                                                            class="transcript-item ${entrySource(t) === 'user' ? 'from-you' : ''} ${
+                                                                i === this.transcripts.length - 1 && !this.interimTranscript ? 'latest' : ''
+                                                            }"
+                                                        >
+                                                            ${entrySource(t) === 'user' ? html`<span class="speaker-tag you">You</span>` : ''}${entryText(t)}
+                                                        </div>
+                                                    `
+                                                )}
+                                                ${
+                                                    this.interimTranscript
+                                                        ? html`
+                                                              <div class="transcript-item interim ${latestSource === 'user' ? 'from-you' : ''}">
+                                                                  ${latestSource === 'user' ? html`<span class="speaker-tag you">You</span>` : ''}${this.interimTranscript}
+                                                              </div>
+                                                          `
+                                                        : ''
+                                                }
+                                            </div>
+                                        `
+                                      : ''
+                              }
                           </div>
                       `
                     : ''

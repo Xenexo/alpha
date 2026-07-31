@@ -219,14 +219,14 @@ test('interview prompt commits to always-answering and forbids garble meta-comme
     assert.match(p, /Assuming you're asking/i);
     assert.match(p, /too garbled/i); // present only inside the "never say ..." prohibition
     assert.match(p, /NO META-COMMENTARY/);
-    assert.match(p, /3 to 5 lines/i); // default is a short paragraph; details are on-demand
+    assert.match(p, /Quick Summary/i); // structured answer mode with 1-2 line quick summary
     assert.match(p, /CDN/); // the worked example is included
 });
 
 test('conversational prompt no longer tells the model to stay silent on fuzzy speech', () => {
     const p = seam.CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT;
     assert.ok(!/rather than guessing/i.test(p), 'the silence escape-hatch must be gone');
-    assert.match(p, /never reply with nothing/i);
+    assert.match(p, /What to say/i);
 });
 
 test('the recoverable CDN transcript passes the noise filter (reaches Claude)', () => {
@@ -276,7 +276,9 @@ test('whisper bias prompt matches the transcription script: Devanagari for hi, L
     }
     // Defaults and non-technical profiles are unchanged.
     assert.equal(seam.whisperContextPromptForProfile('interview'), en);
-    assert.equal(seam.whisperContextPromptForProfile('relationship', 'hi'), '');
+    const relationshipHindi = seam.whisperContextPromptForProfile('relationship', 'hi');
+    assert.match(relationshipHindi, /[ऀ-ॿ]/, 'Hindi relationship calls should bias Whisper toward conversational Hindi');
+    assert.match(relationshipHindi, /weekend/, 'Hinglish vocabulary should remain in Latin script');
 });
 
 // ── System design detection ──
@@ -681,4 +683,116 @@ test('expanding a design answer uses the full-framework design expansion prompt'
     assert.match(expandPrompt, /capacity estimation/i);
     assert.match(expandPrompt, /trade-offs/i);
     assert.match(expandPrompt, /Design a news feed for millions of users\./);
+});
+
+// ── The user's own speech (mic) as context, never as a question ──
+
+test('mic speech is recorded as context and never dispatched as a question', async () => {
+    resetAll();
+    seam.recordUserSpeech("I'd use a token bucket in Redis for this.");
+
+    // Nothing was sent to Claude, and nothing is queued to be sent.
+    assert.equal(spawnCalls.length, 0);
+    assert.equal(seam.getStateForTests().pendingCount, 0);
+    assert.equal(seam.getStateForTests().unsentUserSpeechCount, 1);
+    // The UI is told, so the user can see their own speech was heard.
+    assert.ok(rendererEvents.some(e => e.channel === 'user-transcript' && /token bucket/.test(e.data)));
+});
+
+test("the user's speech rides along with the next question, labelled as context only", async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'shard by user id' }]));
+
+    seam.recordUserSpeech("I'd use a token bucket in Redis.");
+    seam.queueTranscript('How would you shard that?');
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    const sent = spawnCalls[0].proc.userMessages[0];
+    // Both blocks present, and the roles are unambiguous.
+    assert.match(sent, /token bucket in Redis/);
+    assert.match(sent, /How would you shard that\?/);
+    assert.match(sent, /DO NOT ANSWER OR REPLY TO THIS/);
+    assert.match(sent, /ANSWER ONLY THIS/);
+    // The context block precedes the question it is context for.
+    assert.ok(sent.indexOf('token bucket in Redis') < sent.indexOf('How would you shard that?'));
+    // Saved history and the "expand" target are the clean question, not the wrapper.
+    assert.equal(savedTurns[0][0], 'How would you shard that?');
+});
+
+test('context is consumed once an answer lands, so it is not re-sent every turn', async () => {
+    resetAll();
+    spawnQueue.push(persistentScript([{ text: 'first' }, { text: 'second' }]));
+
+    seam.recordUserSpeech('I already mentioned Postgres.');
+    seam.queueTranscript('Why that database?');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(seam.getStateForTests().unsentUserSpeechCount, 0);
+
+    seam.queueTranscript('And how do you back it up?');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const second = spawnCalls[0].proc.userMessages[1];
+    assert.doesNotMatch(second, /I already mentioned Postgres/);
+    assert.doesNotMatch(second, /DO NOT ANSWER OR REPLY TO THIS/);
+});
+
+test('a failed request keeps the context so the resend still carries it', async () => {
+    resetAll();
+    // The persistent transport produces nothing, so the turn fails.
+    spawnQueue.push(persistentScript([{ silent: true }]));
+
+    seam.recordUserSpeech('I said I would use Kafka.');
+    seam.queueTranscript('Why a queue there?');
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    // Context survived the failure — it was never answered, so it is still owed.
+    assert.equal(seam.getStateForTests().unsentUserSpeechCount, 1);
+});
+
+test('mic audio that merely echoes the interviewer is not recorded as the user speaking', async () => {
+    resetAll();
+    seam.rememberSpeakerSpeech('So tell me how you would design a distributed rate limiter for our API.');
+
+    // Laptop speakers bleeding into the mic: same words, slightly mis-heard.
+    seam.recordUserSpeech('so tell me how you would design a distributed rate limiter for our api');
+    assert.equal(seam.getStateForTests().unsentUserSpeechCount, 0);
+
+    // A genuine answer on the same topic is still kept — overlap alone is not echo.
+    seam.recordUserSpeech('Sure, I would start with a token bucket per API key and keep counters in Redis.');
+    assert.equal(seam.getStateForTests().unsentUserSpeechCount, 1);
+});
+
+test('short mic fragments are kept — the echo ratio is meaningless on a few words', () => {
+    resetAll();
+    seam.rememberSpeakerSpeech('okay right yes sure');
+    assert.equal(seam.looksLikeEcho('okay right'), false);
+});
+
+test('withUserSpeechContext is a no-op when the user has not spoken', () => {
+    resetAll();
+    assert.equal(seam.withUserSpeechContext('Explain CAP theorem.'), 'Explain CAP theorem.');
+});
+
+test('a long stretch of user speech is truncated from the front, keeping the recent tail', () => {
+    resetAll();
+    seam.recordUserSpeech('EARLIEST ' + 'padding '.repeat(400) + 'MOST RECENT');
+    const context = seam.peekUserSpeechContext();
+    assert.ok(context.startsWith('…'));
+    assert.match(context, /MOST RECENT$/);
+    assert.doesNotMatch(context, /EARLIEST/);
+});
+
+test('push-to-talk flushes the mic stream tagged as an intentional question', () => {
+    resetAll();
+    const flushes = [];
+    transcriberStub.flush = (source, opts) => {
+        flushes.push({ source, opts });
+        return true;
+    };
+    claude.setPushToTalk(true);
+    claude.setPushToTalk(false);
+    assert.equal(flushes.length, 1);
+    assert.equal(flushes[0].source, 'mic');
+    // Relabelled, so the transcript is answered instead of filed as context.
+    assert.equal(flushes[0].opts.asSource, seam.MIC_ASK_SOURCE);
+    assert.notEqual(seam.MIC_ASK_SOURCE, 'mic');
 });

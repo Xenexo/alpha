@@ -393,6 +393,7 @@ export class CheatingDaddyApp extends LitElement {
         responses: { type: Array },
         transcripts: { type: Array },
         interimTranscript: { type: String },
+        interimTranscriptSource: { type: String },
         currentResponseIndex: { type: Number },
         selectedScreenshotInterval: { type: String },
         selectedImageQuality: { type: String },
@@ -424,6 +425,7 @@ export class CheatingDaddyApp extends LitElement {
         this.responses = [];
         this.transcripts = [];
         this.interimTranscript = '';
+        this.interimTranscriptSource = 'speaker';
         this._interimClearTimer = null;
         this.currentResponseIndex = -1;
         this._viewInstances = new Map();
@@ -533,22 +535,40 @@ export class CheatingDaddyApp extends LitElement {
                 if (this._speakerMode) this._stopSpeaking();
             });
             ipcRenderer.on('new-transcript', (_, transcript) => {
-                if (this._transcriptWasSuperseded && this.transcripts.length > 0) {
+                const entry = { text: transcript, source: 'speaker' };
+                // Only a speaker entry can be superseded — the combined resend
+                // replaces it. A "you" entry in between must not be clobbered.
+                const last = this.transcripts[this.transcripts.length - 1];
+                if (this._transcriptWasSuperseded && last && last.source === 'speaker') {
                     // The combined transcript contains the superseded one.
-                    this.transcripts = [...this.transcripts.slice(0, -1), transcript];
+                    this.transcripts = [...this.transcripts.slice(0, -1), entry];
                 } else {
-                    this.transcripts = [...this.transcripts, transcript];
+                    this.transcripts = [...this.transcripts, entry];
                 }
                 this._transcriptWasSuperseded = false;
                 this._clearInterim();
                 this.requestUpdate();
             });
-            // Live partial transcript while the user is still speaking. Replaced
-            // by the finalized entry when 'new-transcript' lands; cleared on a
-            // safety timeout in case the utterance was filtered as filler and no
-            // final transcript ever arrives.
-            ipcRenderer.on('interim-transcript', (_, transcript) => {
-                this.interimTranscript = transcript || '';
+            // The user's own speech (mic). Shown in the transcript strip labelled
+            // "You" so they can see it was heard, but it produces no answer — it
+            // is context for the next question the other person asks.
+            ipcRenderer.on('user-transcript', (_, transcript) => {
+                if (!transcript) return;
+                this.transcripts = [...this.transcripts, { text: transcript, source: 'user' }];
+                // A finalized "you" line replaces the live caption that produced it.
+                this._clearInterim();
+                this.requestUpdate();
+            });
+            // Live partial transcript while someone is still speaking. Replaced
+            // by the finalized entry when 'new-transcript'/'user-transcript'
+            // lands; cleared on a safety timeout in case the utterance was
+            // filtered as filler and no final transcript ever arrives.
+            ipcRenderer.on('interim-transcript', (_, payload) => {
+                // Payload is { text, source }; tolerate a bare string in case an
+                // older provider path still sends one.
+                const { text, source } = typeof payload === 'string' ? { text: payload, source: 'speaker' } : payload || {};
+                this.interimTranscript = text || '';
+                this.interimTranscriptSource = source === 'mic' ? 'user' : 'speaker';
                 if (this._interimClearTimer) clearTimeout(this._interimClearTimer);
                 this._interimClearTimer = setTimeout(() => this._clearInterim(), 5000);
                 this.requestUpdate();
@@ -579,6 +599,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('response-complete');
             ipcRenderer.removeAllListeners('response-superseded');
             ipcRenderer.removeAllListeners('new-transcript');
+            ipcRenderer.removeAllListeners('user-transcript');
             ipcRenderer.removeAllListeners('interim-transcript');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
@@ -632,14 +653,14 @@ export class CheatingDaddyApp extends LitElement {
         }
         if (this.interimTranscript) {
             this.interimTranscript = '';
+            this.interimTranscriptSource = 'speaker';
             this.requestUpdate();
         }
     }
 
     addNewResponse(response, replaceLast = false) {
         const wasOnLatest = this.currentResponseIndex === this.responses.length - 1;
-        this.responses =
-            replaceLast && this.responses.length > 0 ? [...this.responses.slice(0, -1), response] : [...this.responses, response];
+        this.responses = replaceLast && this.responses.length > 0 ? [...this.responses.slice(0, -1), response] : [...this.responses, response];
         if (wasOnLatest || this.currentResponseIndex === -1) {
             this.currentResponseIndex = this.responses.length - 1;
         }
@@ -1055,6 +1076,7 @@ export class CheatingDaddyApp extends LitElement {
                         .responses=${this.responses}
                         .transcripts=${this.transcripts}
                         .interimTranscript=${this.interimTranscript}
+                        .interimTranscriptSource=${this.interimTranscriptSource}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}
                         .onSendText=${msg => this.handleSendText(msg)}
@@ -1167,23 +1189,25 @@ export class CheatingDaddyApp extends LitElement {
                     )}
                 </nav>
                 <div class="sidebar-footer">
-                    ${this._updateAvailable
-                        ? html`
-                              <button class="update-btn" @click=${() => this.handleExternalLinkClick('https://cheatingdaddy.com/download')}>
-                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                                      <path
-                                          fill="none"
-                                          stroke="currentColor"
-                                          stroke-linecap="round"
-                                          stroke-linejoin="round"
-                                          stroke-width="2"
-                                          d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2M7 11l5 5l5-5m-5-7v12"
-                                      />
-                                  </svg>
-                                  Update available
-                              </button>
-                          `
-                        : html` <div class="version-text">v${this._localVersion}</div> `}
+                    ${
+                        this._updateAvailable
+                            ? html`
+                                  <button class="update-btn" @click=${() => this.handleExternalLinkClick('https://cheatingdaddy.com/download')}>
+                                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                                          <path
+                                              fill="none"
+                                              stroke="currentColor"
+                                              stroke-linecap="round"
+                                              stroke-linejoin="round"
+                                              stroke-width="2"
+                                              d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2M7 11l5 5l5-5m-5-7v12"
+                                          />
+                                      </svg>
+                                      Update available
+                                  </button>
+                              `
+                            : html` <div class="version-text">v${this._localVersion}</div> `
+                    }
                 </div>
             </div>
         `;
