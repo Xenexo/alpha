@@ -40,7 +40,12 @@ const transcriberStub = {
     },
     resetTranscriber() {},
 };
-const promptsStub = { getSystemPrompt: () => 'TEST SYSTEM PROMPT' };
+let storedPreferences = {};
+const storageStub = { getPreferences: () => storedPreferences };
+const promptsStub = {
+    getSystemPrompt: () => 'TEST SYSTEM PROMPT',
+    profilePrompts: require(path.join(__dirname, '..', 'src', 'utils', 'prompts.js')).profilePrompts,
+};
 
 class FakeStdin {
     constructor(proc) {
@@ -120,6 +125,7 @@ Module._load = function (request, parent, isMain) {
     if (request === './gemini') return geminiStub;
     if (request === './transcriber') return transcriberStub;
     if (request === './prompts') return promptsStub;
+    if (request === '../storage') return storageStub;
     return originalLoad.call(this, request, parent, isMain);
 };
 
@@ -201,6 +207,7 @@ function resetAll() {
     statusMessages.length = 0;
     savedTurns.length = 0;
     pipelineBusy = false;
+    storedPreferences = {};
     seam.setStateForTests({ active: true, transportReady: true, mode: 'cli', model: 'claude-haiku-4-5-20251001' });
 }
 
@@ -227,6 +234,16 @@ test('conversational prompt no longer tells the model to stay silent on fuzzy sp
     const p = seam.CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT;
     assert.ok(!/rather than guessing/i.test(p), 'the silence escape-hatch must be gone');
     assert.match(p, /What to say/i);
+});
+
+test('the spoken line may never carry meta about tools, permissions, or the assistant itself', () => {
+    const p = seam.CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT;
+    assert.match(p, /spoken aloud verbatim/i, 'the model has to know this line is read out on a live call');
+    assert.match(p, /NEVER mention searching, tools, permissions/i);
+    assert.ok(
+        !/ALWAYS search the web/i.test(p),
+        'an unconditional search order strands the model when the tool is off — the rule is appended only when search is enabled'
+    );
 });
 
 test('the recoverable CDN transcript passes the noise filter (reaches Claude)', () => {
@@ -316,6 +333,46 @@ test('whisper context prompt covers system-design vocabulary for technical profi
         assert.ok(p.includes(term), `vocabulary must include "${term}"`);
     }
     assert.equal(seam.whisperContextPromptForProfile('relationship'), '');
+});
+
+test('the googleSearchEnabled preference controls whether the session may search the web', () => {
+    storedPreferences = {};
+    assert.equal(seam.readWebSearchPreference(), false, 'an unset preference must not silently grant web access');
+    storedPreferences = { googleSearchEnabled: false };
+    assert.equal(seam.readWebSearchPreference(), false);
+    storedPreferences = { googleSearchEnabled: true };
+    assert.equal(seam.readWebSearchPreference(), true);
+
+    seam.setWebSearchEnabledForTests(false);
+    assert.deepEqual(seam.cliAllowedTools(), ['Read'], 'Read alone is what screenshot analysis needs');
+    seam.setWebSearchEnabledForTests(true);
+    assert.deepEqual(
+        seam.cliAllowedTools(),
+        ['Read', 'WebSearch', 'WebFetch'],
+        'searching finds URLs but reading them needs WebFetch; --allowedTools is variadic, so one argv entry per tool'
+    );
+    seam.setWebSearchEnabledForTests(false);
+    storedPreferences = {};
+});
+
+test('only the interview profile is seeded with software-engineering vocabulary', () => {
+    const tech = seam.whisperContextPromptForProfile('interview');
+    for (const profile of ['exam', 'mcq', 'sales', 'meeting', 'presentation', 'negotiation']) {
+        assert.equal(
+            seam.whisperContextPromptForProfile(profile),
+            '',
+            `"${profile}" is not a software-engineering profile — Kafka and mutexes must not bias its decoding`
+        );
+        assert.ok(
+            !seam.whisperContextPromptForProfile(profile, 'hi').includes('Kubernetes'),
+            `"${profile}" must not carry tech jargon in Hindi either`
+        );
+    }
+    for (const profile of ['exam', 'mcq', 'sales', 'meeting']) {
+        assert.match(seam.whisperContextPromptForProfile(profile, 'hi'), /[ऀ-ॿ]/, `"${profile}" still needs a Devanagari anchor for Hindi sessions`);
+    }
+    assert.equal(seam.whisperContextPromptForProfile(undefined), tech, 'a missing profile falls back to interview, as getSystemPrompt does');
+    assert.equal(seam.whisperContextPromptForProfile('not-a-real-profile'), tech, 'an unrecognized profile falls back the same way');
 });
 
 // ── Direct one-shot CLI invocation (compatibility path) ──
@@ -639,6 +696,98 @@ test('transcript heard during Claude warm-up is queued, then answered once ready
     assert.ok(rendererEvents.some(e => e.channel === 'new-transcript' && e.data === 'What is a binary tree?'));
     assert.ok(rendererEvents.some(e => e.channel === 'new-response' && e.data.includes('binary tree')));
     assert.equal(seam.getStateForTests().isTranscriptResponseInFlight, false, 'in-flight flag must clear after the answer');
+});
+
+// ── Speaker-only (spoken) answers ──
+
+test('speaker-only mode asks for a short spoken answer instead of the read layout', async () => {
+    resetAll();
+    storedPreferences = { speakerMode: true };
+    spawnQueue.push(persistentScript([{ text: 'Use a bloom filter.' }]));
+
+    await claude.sendClaudeText('What is a bloom filter?');
+
+    const sent = spawnCalls[0].proc.userMessages[0];
+    assert.match(sent, /SPEAKER-ONLY MODE/);
+    assert.match(sent, /30 words maximum/);
+    assert.match(sent, /no markdown/i);
+    assert.ok(sent.endsWith('What is a bloom filter?'), 'the raw question must close the prompt');
+    assert.equal(savedTurns[0][0], 'What is a bloom filter?', 'saved history must not contain the injected rules');
+});
+
+test('speaker-only mode suppresses the structured design framework', async () => {
+    resetAll();
+    storedPreferences = { speakerMode: true };
+    spawnQueue.push(persistentScript([{ text: 'Shard by user id.' }]));
+
+    await claude.sendClaudeText('How would you design WhatsApp?');
+
+    const sent = spawnCalls[0].proc.userMessages[0];
+    assert.match(sent, /SPEAKER-ONLY MODE/);
+    assert.ok(!/STRUCTURED ANSWER MODE/.test(sent), 'a spoken answer must not get the multi-section design framework');
+});
+
+test('an explicit details request still gets the long form in speaker-only mode', async () => {
+    resetAll();
+    storedPreferences = { speakerMode: true };
+    spawnQueue.push(persistentScript([{ text: 'short spoken answer' }, { text: 'the detailed version' }]));
+
+    await claude.sendClaudeText('How does TCP work?');
+    const r = await claude.expandLastAnswer();
+
+    assert.equal(r.success, true);
+    const expandPrompt = spawnCalls[0].proc.userMessages[1];
+    assert.ok(!/SPEAKER-ONLY MODE/.test(expandPrompt), 'the brevity rules must not clip an explicit expansion');
+});
+
+test('screen mode leaves the spoken rules out entirely', async () => {
+    resetAll();
+    storedPreferences = { speakerMode: false };
+    spawnQueue.push(persistentScript([{ text: 'plain answer' }]));
+
+    await claude.sendClaudeText('What is a deadlock?');
+    assert.equal(spawnCalls[0].proc.userMessages[0], 'What is a deadlock?');
+});
+
+// ── Auto answer toggle ──
+
+test('auto answer off shows the heard speech but sends no request', async () => {
+    resetAll();
+    seam.setAutoAnswerForTests(false);
+    spawnQueue.push(persistentScript([{ text: 'should never be asked' }]));
+
+    seam.queueTranscript('What is a bloom filter?');
+    await new Promise(r => setTimeout(r, 300));
+
+    assert.equal(spawnCalls.length, 0, 'no request may fire while auto answer is off');
+    assert.ok(rendererEvents.some(e => e.channel === 'new-transcript' && e.data === 'What is a bloom filter?'));
+    assert.ok(statusMessages.some(s => /auto answer off/i.test(s)));
+    assert.equal(seam.getStateForTests().pendingCount, 0);
+});
+
+test('speech heard while auto answer is off is still answerable on demand', async () => {
+    resetAll();
+    seam.setAutoAnswerForTests(false);
+    spawnQueue.push(persistentScript([{ text: 'a bloom filter is…' }]));
+
+    seam.queueTranscript('What is a bloom filter?');
+    await new Promise(r => setTimeout(r, 150));
+
+    const result = await claude.answerWithContext();
+    assert.equal(result.success, true);
+    assert.match(spawnCalls[0].proc.userMessages[0], /What is a bloom filter\?/);
+});
+
+test('turning auto answer back on answers subsequent speech', async () => {
+    resetAll();
+    seam.setAutoAnswerForTests(false);
+    seam.toggleAutoAnswer();
+    assert.equal(seam.isAutoAnswerEnabled(), true);
+    spawnQueue.push(persistentScript([{ text: 'an answer' }]));
+
+    seam.queueTranscript('What is a deadlock?');
+    await waitFor(() => rendererEvents.some(e => e.channel === 'response-complete'));
+    assert.equal(spawnCalls[0].proc.userMessages[0], 'What is a deadlock?');
 });
 
 // ── Detailed-answer expansion ──

@@ -41,6 +41,17 @@ const DEFAULT_SOURCE = 'speaker';
 // rather than a cold start mid-utterance (which triggers hallucinations in tiny model).
 const PRE_SPEECH_FRAMES = 12;
 
+const EMPTY_BUFFER = Buffer.alloc(0);
+const INV_32768 = 1 / 32768;
+
+function getInt16View(buf, lengthInSamples) {
+    if (buf.byteOffset % 2 === 0) {
+        return new Int16Array(buf.buffer, buf.byteOffset, lengthInSamples);
+    }
+    const copy = Buffer.from(buf);
+    return new Int16Array(copy.buffer, copy.byteOffset, lengthInSamples);
+}
+
 // Per-source pipeline state. Everything here is inherently about one talker's
 // utterance in progress, so it cannot be shared between sources.
 function createStream(source) {
@@ -53,8 +64,12 @@ function createStream(source) {
         speechFrameCount: 0,
         preSpeechBuffer: [],
         lastInterimFrameCount: 0,
+        noiseFloor: vadConfig.energyThreshold / VAD_START_SNR,
+        speechLevel: 0,
         // Audio resampling remainder (24kHz → 16kHz leftover samples)
-        resampleRemainder: Buffer.alloc(0),
+        resampleRemainder: EMPTY_BUFFER,
+        antiAliasHistory: new Float32Array(ANTIALIAS_TAPS - 1),
+        antiAliasScratch: null,
     };
 }
 
@@ -87,9 +102,12 @@ function streamStatus(stream, message) {
 // silence plus a whole-utterance inference pass. Each frame is ~0.1s. This is
 // a floor, not a schedule: runInterim only advances the counter when it
 // actually starts an inference, so on a slow backend the effective cadence
-// degrades gracefully to max(interval, inference time).
+// degrades gracefully to inference time plus INTERIM_MIN_GAP_MS.
 const INTERIM_INTERVAL_FRAMES = 8;
+const INTERIM_MIN_GAP_MS = 1500;
 let lastInterimFrameCount = 0;
+let lastInterimFinishedAt = 0;
+let interimMinGapMs = INTERIM_MIN_GAP_MS;
 
 // Continuous speech with no VAD-length pause (a video, a monologue) would
 // otherwise accumulate without bound — inference time grows with audio length,
@@ -117,18 +135,126 @@ const VAD_MODES = {
     LOW_BITRATE: { energyThreshold: 0.008, speechFramesRequired: 4, silenceFramesRequired: 35 },
     AGGRESSIVE: { energyThreshold: 0.015, speechFramesRequired: 2, silenceFramesRequired: 20 },
     VERY_AGGRESSIVE: { energyThreshold: 0.02, speechFramesRequired: 2, silenceFramesRequired: 3 },
-    // Each VAD frame is ~0.1s. A ~0.5s end-of-utterance silence balances
+    // Each VAD frame is ~0.1s. A ~0.8s end-of-utterance silence balances
     // dispatch latency against fragmentation: short enough that an answer
     // starts promptly after a natural pause, long enough that ordinary
     // mid-sentence breaths don't chop the question. A question split across a
     // longer pause still merges downstream (100ms flush debounce), and if an
     // answer already started, the supersede path cancels and resends the
     // combined transcript — so a too-early turn-end costs little.
-    BALANCED: { energyThreshold: 0.012, speechFramesRequired: 2, silenceFramesRequired: 5 },
+    BALANCED: { energyThreshold: 0.012, speechFramesRequired: 2, silenceFramesRequired: 8 },
 };
 let vadConfig = VAD_MODES.BALANCED;
 
+const VAD_START_SNR = 3;
+const VAD_SUSTAIN_SNR = 1.4;
+const VAD_MIN_THRESHOLD_RATIO = 0.25;
+const VAD_MAX_THRESHOLD_RATIO = 2.5;
+const NOISE_FLOOR_FALL = 0.3;
+const NOISE_FLOOR_RISE = 0.004;
+const VAD_SUSTAIN_SPEECH_RATIO = 0.08;
+const SPEECH_LEVEL_ALPHA = 0.15;
+
+function speechThresholds(stream) {
+    const base = vadConfig.energyThreshold;
+    const start = Math.min(base * VAD_MAX_THRESHOLD_RATIO, Math.max(base * VAD_MIN_THRESHOLD_RATIO, stream.noiseFloor * VAD_START_SNR));
+    let sustain = Math.max(base * VAD_MIN_THRESHOLD_RATIO * 0.5, stream.noiseFloor * VAD_SUSTAIN_SNR);
+    if (stream.isSpeaking && stream.speechLevel > 0) {
+        sustain = Math.max(sustain, stream.speechLevel * VAD_SUSTAIN_SPEECH_RATIO);
+    }
+    return { start, sustain: Math.min(start, sustain) };
+}
+
+function updateSpeechLevel(stream, rms) {
+    stream.speechLevel = stream.speechLevel > 0 ? stream.speechLevel + SPEECH_LEVEL_ALPHA * (rms - stream.speechLevel) : rms;
+}
+
+function updateNoiseFloor(stream, rms) {
+    const base = vadConfig.energyThreshold;
+    const alpha = rms < stream.noiseFloor ? NOISE_FLOOR_FALL : NOISE_FLOOR_RISE;
+    stream.noiseFloor = Math.min(base, Math.max(base * 0.02, stream.noiseFloor + alpha * (rms - stream.noiseFloor)));
+}
+
+const SEGMENT_PRE_ROLL_FRAMES = 4;
+const SEGMENT_POST_ROLL_FRAMES = 4;
+const SEGMENT_MIN_VOICED_FRAMES = 3;
+
+function trimSegment(frames, threshold) {
+    let first = -1;
+    let last = -1;
+    let voiced = 0;
+    for (let i = 0; i < frames.length; i++) {
+        if (calculateRMS(frames[i]) > threshold) {
+            if (first === -1) first = i;
+            last = i;
+            voiced++;
+        }
+    }
+    if (first === -1) return { frames: [], voiced: 0 };
+    const from = Math.max(0, first - SEGMENT_PRE_ROLL_FRAMES);
+    const to = Math.min(frames.length, last + 1 + SEGMENT_POST_ROLL_FRAMES);
+    return { frames: frames.slice(from, to), voiced };
+}
+
 // ── Audio Resampling (24kHz → 16kHz) ──
+
+const ANTIALIAS_TAPS = 95;
+const ANTIALIAS_CUTOFF_HZ = 7600;
+const ANTIALIAS_SAMPLE_RATE = 24000;
+
+function designLowpassCoefficients(cutoffHz, sampleRate, taps) {
+    const normalizedCutoff = cutoffHz / sampleRate;
+    const center = (taps - 1) / 2;
+    const coefficients = new Float32Array(taps);
+    let sum = 0;
+    for (let n = 0; n < taps; n++) {
+        const offset = n - center;
+        const sinc = offset === 0 ? 2 * normalizedCutoff : Math.sin(2 * Math.PI * normalizedCutoff * offset) / (Math.PI * offset);
+        const hamming = 0.54 - 0.46 * Math.cos((2 * Math.PI * n) / (taps - 1));
+        coefficients[n] = sinc * hamming;
+        sum += coefficients[n];
+    }
+    for (let n = 0; n < taps; n++) coefficients[n] /= sum;
+    return coefficients;
+}
+
+const ANTIALIAS_COEFFICIENTS = designLowpassCoefficients(ANTIALIAS_CUTOFF_HZ, ANTIALIAS_SAMPLE_RATE, ANTIALIAS_TAPS);
+
+function lowpass24k(pcm24kBuffer, stream) {
+    const samples = Math.floor(pcm24kBuffer.length / 2);
+    if (samples === 0) return pcm24kBuffer;
+
+    const history = stream.antiAliasHistory;
+    const historyLength = history.length;
+    const totalRequired = historyLength + samples;
+
+    let scratch = stream.antiAliasScratch;
+    if (!scratch || scratch.length < totalRequired) {
+        scratch = new Float32Array(Math.max(totalRequired, 4096));
+        stream.antiAliasScratch = scratch;
+    }
+
+    scratch.set(history, 0);
+    const inView = getInt16View(pcm24kBuffer, samples);
+    for (let i = 0; i < samples; i++) {
+        scratch[historyLength + i] = inView[i];
+    }
+
+    const output = Buffer.allocUnsafe(samples * 2);
+    const outView = new Int16Array(output.buffer, output.byteOffset, samples);
+    for (let i = 0; i < samples; i++) {
+        let acc = 0;
+        const base = historyLength + i;
+        for (let k = 0; k < ANTIALIAS_TAPS; k++) {
+            acc += ANTIALIAS_COEFFICIENTS[k] * scratch[base - k];
+        }
+        const rounded = Math.round(acc);
+        outView[i] = rounded < -32768 ? -32768 : rounded > 32767 ? 32767 : rounded;
+    }
+
+    history.set(scratch.subarray(samples, samples + historyLength));
+    return output;
+}
 
 function resample24kTo16k(inputBuffer, stream) {
     // Combine with any leftover samples from previous call
@@ -136,27 +262,40 @@ function resample24kTo16k(inputBuffer, stream) {
     const inputSamples = Math.floor(combined.length / 2); // 16-bit = 2 bytes per sample
     // Ratio: 16000/24000 = 2/3, so for every 3 input samples we produce 2 output samples
     const outputSamples = Math.floor((inputSamples * 2) / 3);
+    if (outputSamples === 0) {
+        stream.resampleRemainder = combined;
+        return EMPTY_BUFFER;
+    }
     const outputBuffer = Buffer.allocUnsafe(outputSamples * 2);
 
-    const inView = new Int16Array(combined.buffer, combined.byteOffset, inputSamples);
+    const inView = getInt16View(combined, inputSamples);
     const outView = new Int16Array(outputBuffer.buffer, outputBuffer.byteOffset, outputSamples);
 
-    for (let i = 0; i < outputSamples; i++) {
-        // Map output sample index to input position
-        const srcPos = (i * 3) / 2;
-        const srcIndex = Math.floor(srcPos);
-        const frac = srcPos - srcIndex;
+    const pairs = outputSamples >> 1;
+    let inIdx = 0;
+    let outIdx = 0;
 
-        const s0 = inView[srcIndex];
-        const s1 = srcIndex + 1 < inputSamples ? inView[srcIndex + 1] : s0;
-        const interpolated = Math.round(s0 + frac * (s1 - s0));
-        outView[i] = Math.max(-32768, Math.min(32767, interpolated));
+    for (let k = 0; k < pairs; k++) {
+        const s0 = inView[inIdx];
+        const s1 = inView[inIdx + 1];
+        const s2 = inIdx + 2 < inputSamples ? inView[inIdx + 2] : s1;
+
+        outView[outIdx] = s0;
+        const interpolated = Math.round(s1 + 0.5 * (s2 - s1));
+        outView[outIdx + 1] = interpolated < -32768 ? -32768 : interpolated > 32767 ? 32767 : interpolated;
+
+        inIdx += 3;
+        outIdx += 2;
+    }
+
+    if (outputSamples & 1) {
+        outView[outIdx] = inView[inIdx];
     }
 
     // Store remainder for next call
     const consumedInputSamples = Math.ceil((outputSamples * 3) / 2);
     const remainderStart = consumedInputSamples * 2;
-    stream.resampleRemainder = remainderStart < combined.length ? combined.subarray(remainderStart) : Buffer.alloc(0);
+    stream.resampleRemainder = remainderStart < combined.length ? combined.subarray(remainderStart) : EMPTY_BUFFER;
 
     return outputBuffer;
 }
@@ -166,27 +305,29 @@ function resample24kTo16k(inputBuffer, stream) {
 function calculateRMS(pcm16Buffer) {
     const samples = Math.floor(pcm16Buffer.length / 2);
     if (samples === 0) return 0;
-    const view = new Int16Array(pcm16Buffer.buffer, pcm16Buffer.byteOffset, samples);
+    const view = getInt16View(pcm16Buffer, samples);
     let sumSquares = 0;
     for (let i = 0; i < samples; i++) {
-        const sample = view[i] / 32768;
-        sumSquares += sample * sample;
+        sumSquares += view[i] * view[i];
     }
-    return Math.sqrt(sumSquares / samples);
+    return Math.sqrt(sumSquares / samples) * INV_32768;
 }
 
-function processVAD(pcm16kBuffer, stream) {
-    const rms = calculateRMS(pcm16kBuffer);
-    const isVoice = rms > vadConfig.energyThreshold;
+function processVAD(pcm16kBuffer, stream, rms = calculateRMS(pcm16kBuffer)) {
+    const { start, sustain } = speechThresholds(stream);
+    const isVoice = rms > (stream.isSpeaking ? sustain : start);
+    if (!stream.isSpeaking) updateNoiseFloor(stream, rms);
 
     if (isVoice) {
         stream.speechFrameCount++;
         stream.silenceFrameCount = 0;
+        if (stream.isSpeaking) updateSpeechLevel(stream, rms);
 
         if (!stream.isSpeaking && stream.speechFrameCount >= vadConfig.speechFramesRequired) {
             stream.isSpeaking = true;
+            stream.speechLevel = rms;
             // preSpeechBuffer already contains recent silence + the confirmation frames
-            stream.speechBuffers = stream.preSpeechBuffer.map(b => Buffer.from(b));
+            stream.speechBuffers = stream.preSpeechBuffer;
             stream.preSpeechBuffer = [];
             // Don't fire the first interim until a full interval of new speech.
             stream.lastInterimFrameCount = stream.speechBuffers.length;
@@ -204,7 +345,7 @@ function processVAD(pcm16kBuffer, stream) {
         // they're already in speechBuffers via the seed above, so only buffer while
         // isSpeaking is still false.
         if (!stream.isSpeaking) {
-            stream.preSpeechBuffer.push(Buffer.from(pcm16kBuffer));
+            stream.preSpeechBuffer.push(pcm16kBuffer);
             if (stream.preSpeechBuffer.length > PRE_SPEECH_FRAMES) {
                 stream.preSpeechBuffer.shift();
             }
@@ -212,7 +353,7 @@ function processVAD(pcm16kBuffer, stream) {
     } else {
         // While not speaking, maintain a rolling window of recent audio
         if (!stream.isSpeaking) {
-            stream.preSpeechBuffer.push(Buffer.from(pcm16kBuffer));
+            stream.preSpeechBuffer.push(pcm16kBuffer);
             if (stream.preSpeechBuffer.length > PRE_SPEECH_FRAMES) {
                 stream.preSpeechBuffer.shift();
             }
@@ -223,39 +364,37 @@ function processVAD(pcm16kBuffer, stream) {
 
         if (stream.isSpeaking && stream.silenceFrameCount >= vadConfig.silenceFramesRequired) {
             stream.isSpeaking = false;
+            stream.speechLevel = 0;
             console.log(`[Transcriber] Speech ended on ${stream.source}, accumulated`, stream.speechBuffers.length, 'chunks');
             streamStatus(stream, 'Transcribing...');
 
             // Trigger transcription with accumulated audio
-            const audioData = Buffer.concat(stream.speechBuffers);
+            const frames = stream.speechBuffers;
             stream.speechBuffers = [];
-            queueTranscription(audioData, stream);
+            queueSegment(stream, frames, start);
             return;
         }
     }
 
     // Accumulate audio during speech
     if (stream.isSpeaking) {
-        stream.speechBuffers.push(Buffer.from(pcm16kBuffer));
+        stream.speechBuffers.push(pcm16kBuffer);
 
         // Bound the utterance: split long continuous speech into segments so
         // transcription (and the answer) starts while the speaker is still
         // going, instead of one giant slow inference at the very end.
         if (stream.speechBuffers.length >= HARD_SPLIT_FRAMES || (stream.speechBuffers.length >= SOFT_SPLIT_FRAMES && !isVoice)) {
             console.log(`[Transcriber] Long utterance on ${stream.source} — splitting segment at`, stream.speechBuffers.length, 'chunks');
-            const audioData = Buffer.concat(stream.speechBuffers);
-            const segmentRMS = calculateRMS(audioData);
-            if (segmentRMS < vadConfig.energyThreshold * 1.2) {
-                console.log(`[Transcriber] Low-energy noise segment (RMS: ${segmentRMS.toFixed(4)}) on ${stream.source} — discarding`);
+            const frames = stream.speechBuffers;
+            if (!queueSegment(stream, frames, start)) {
                 stream.isSpeaking = false;
+                stream.speechLevel = 0;
                 stream.speechBuffers = [];
                 streamStatus(stream, 'Listening...');
                 return;
             }
-            const overlap = stream.speechBuffers.slice(-SPLIT_OVERLAP_FRAMES);
-            stream.speechBuffers = overlap.map(b => Buffer.from(b));
+            stream.speechBuffers = frames.slice(-SPLIT_OVERLAP_FRAMES);
             stream.lastInterimFrameCount = stream.speechBuffers.length;
-            queueTranscription(audioData, stream);
             return;
         }
 
@@ -279,6 +418,7 @@ function processVAD(pcm16kBuffer, stream) {
 // queued while this runs is drained in the finally, exactly as queueTranscription does.
 async function runInterim(stream) {
     if (isTranscribing || !stream.isSpeaking || stream.speechBuffers.length === 0) return;
+    if (Date.now() - lastInterimFinishedAt < interimMinGapMs) return;
 
     // Consume the interval only now that inference is actually starting (the
     // guard above and this line run synchronously, so no second interim can
@@ -297,6 +437,7 @@ async function runInterim(stream) {
         }
     } finally {
         isTranscribing = false;
+        lastInterimFinishedAt = Date.now();
         drainTranscriptionQueue();
     }
 }
@@ -324,41 +465,59 @@ function getDtypeForModel(modelName) {
 // On ANE/WebGPU the pipeline lives outside this process (sidecar / hidden
 // window), so there is no in-process object to return — `true` signals
 // success without exposing the remote handle.
+// WhisperKit only ships Core ML conversions of OpenAI's stock checkpoints, so
+// ANE sidecar (WhisperKit) ships stock OpenAI CoreML checkpoints that exhibit
+// high error rates and Icelandic/English subtitle hallucinations on Hindi audio.
+// Hindi sessions skip the ANE tier to use WebGPU/CPU with context prompts.
+function canUseAne(modelName) {
+    if (whisperLanguage === 'hi') return false;
+    return whisperkitSidecar.isAvailable() && whisperkitSidecar.supportsModel(modelName);
+}
+
 function loadedHandle() {
     return backend === 'cpu' ? whisperPipeline : backend ? true : null;
 }
 
 async function loadWhisperPipeline(modelName) {
-    if (backend) {
-        // The model remains resident between sessions for fast startup. That
-        // must not make the model picker a no-op: a user who upgrades from
-        // Tiny/Base to Large v3 Turbo expects the next session to use it.
-        if (loadedModelName !== modelName) {
-            console.log(`[Transcriber] Switching Whisper model from "${loadedModelName}" to "${modelName}"`);
+    if (backend === 'ane' && !canUseAne(modelName)) {
+        console.log(`[Transcriber] Neural Engine unusable for language "${whisperLanguage}" — releasing it and reselecting a backend`);
+        whisperkitSidecar.destroy();
+        backend = null;
+        loadedModelName = null;
+    }
 
-            if (backend === 'ane' && whisperkitSidecar.isAvailable()) {
-                await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
-                loadedModelName = modelName;
-                return loadedHandle();
-            }
+    // The model remains resident between sessions for fast startup. That
+    // must not make the model picker a no-op: a user who upgrades from
+    // Tiny/Base to Large v3 Turbo expects the next session to use it.
+    if (backend && loadedModelName !== modelName) {
+        console.log(`[Transcriber] Switching Whisper model from "${loadedModelName}" to "${modelName}"`);
 
-            if (backend === 'webgpu') {
-                await whisperWindow.loadModel(modelName);
-                loadedModelName = modelName;
-                return loadedHandle();
-            }
-
-            // CPU pipelines cannot swap their model in place. Release the
-            // old reference and fall through to the normal loader below.
-            whisperPipeline = null;
-            backend = null;
-            loadedModelName = null;
+        if (backend === 'ane' && canUseAne(modelName)) {
+            await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
+            loadedModelName = modelName;
+            return loadedHandle();
         }
 
+        if (backend === 'webgpu') {
+            await whisperWindow.loadModel(modelName);
+            loadedModelName = modelName;
+            return loadedHandle();
+        }
+
+        // Neither remaining case can swap in place: a CPU pipeline is bound to
+        // its model, and an ANE sidecar has no Core ML build for this one.
+        // Tear the backend down so the selection below runs again from scratch.
+        if (backend === 'ane') whisperkitSidecar.destroy();
+        whisperPipeline = null;
+        backend = null;
+        loadedModelName = null;
+    }
+
+    if (backend) {
         // The pipeline outlives sessions, but the ANE sidecar's language and
         // vocabulary prompt are fixed at server start — reconcile them for the
         // new session (no-op when unchanged, quick restart when they differ).
-        if (backend === 'ane' && whisperkitSidecar.isAvailable()) {
+        if (backend === 'ane' && canUseAne(modelName)) {
             try {
                 await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
             } catch (error) {
@@ -378,7 +537,7 @@ async function loadWhisperPipeline(modelName) {
     // CLI only) > WebGPU (hidden window on the Apple GPU) > in-process CPU.
     // Each tier falls through to the next on unavailability or load failure.
     try {
-        if (whisperkitSidecar.isAvailable()) {
+        if (canUseAne(modelName)) {
             console.log('[Transcriber] Loading Whisper on the Neural Engine (WhisperKit):', modelName);
             const aneStartedAt = Date.now();
             await whisperkitSidecar.loadModel(modelName, whisperLanguage, whisperContextPrompt);
@@ -389,7 +548,11 @@ async function loadWhisperPipeline(modelName) {
             isWhisperLoading = false;
             return loadedHandle();
         }
-        console.log('[Transcriber] WhisperKit sidecar unavailable — trying WebGPU');
+        console.log(
+            whisperkitSidecar.isAvailable()
+                ? `[Transcriber] WhisperKit has no Core ML build for "${modelName}" — trying WebGPU`
+                : '[Transcriber] WhisperKit sidecar unavailable — trying WebGPU'
+        );
     } catch (error) {
         console.error(`[Transcriber] WhisperKit load failed for "${modelName}" — falling back to WebGPU:`, error);
     }
@@ -451,6 +614,28 @@ async function loadWhisperPipeline(modelName) {
     }
 }
 
+// Known Whisper decoder hallucination patterns on silence or quiet background noise
+const HALLUCINATION_PATTERNS = [
+    /^thank you(\s+very\s+much)?[\.!]?$/i,
+    /^thank you for watching[\.!]?$/i,
+    /^subtitles by.*$/i,
+    /^amara\.org.*$/i,
+    /^subscribe to my channel[\.!]?$/i,
+    /^bye[\.!]?$/i,
+    /^goodbye[\.!]?$/i,
+    /^\s*you\s*[\.!]?$/i,
+    /^\s*mbc\s*[\.!]?$/i,
+    /^[.\s,!?-]+$/,
+    // Hindi / Devanagari noise hallucinations on background static
+    /^झाल[ंअा]*$/i,
+    /^छाल[ंअा]*$/i,
+    /^अ[ं०-९]?$/i,
+    /^आ[ं]?$/i,
+    /^हम्म[ं]?$/i,
+    /^सब्सक्राइब.*$/i,
+    /^[अआइईउऊऋएऐओऔंँ\s]{1,2}$/,
+];
+
 // Whisper's decoder sometimes falls into a repetition loop and emits the same
 // word or phrase over and over ("this is this is this is…"), especially on
 // short, partial, or silence-padded audio. `no_repeat_ngram_size` in the
@@ -461,33 +646,38 @@ async function loadWhisperPipeline(modelName) {
 function collapseRepetitions(text) {
     if (!text) return text;
     let words = text.trim().split(/\s+/);
+    if (words.length < 2) return text.trim();
+
     for (let n = 6; n >= 1; n--) {
+        if (words.length < (n === 1 ? 3 : n * 2)) continue;
+        const lower = words.map(w => w.toLowerCase());
         const out = [];
         let i = 0;
-        while (i < words.length) {
-            const gram = words.slice(i, i + n);
-            if (gram.length < n) {
+        const len = words.length;
+        while (i < len) {
+            if (i + n > len) {
                 out.push(words[i]);
                 i++;
                 continue;
             }
-            const key = gram.join(' ').toLowerCase();
             let reps = 1;
             let j = i + n;
-            while (
-                j + n <= words.length &&
-                words
-                    .slice(j, j + n)
-                    .join(' ')
-                    .toLowerCase() === key
-            ) {
+            while (j + n <= len) {
+                let match = true;
+                for (let k = 0; k < n; k++) {
+                    if (lower[i + k] !== lower[j + k]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match) break;
                 reps++;
                 j += n;
             }
             // A single word must repeat 3+ times to count as a loop (genuine
             // doubles like "very very" are fine); phrases collapse at 2+.
             if (reps >= (n === 1 ? 3 : 2)) {
-                out.push(...gram);
+                for (let k = 0; k < n; k++) out.push(words[i + k]);
                 i = j;
             } else {
                 out.push(words[i]);
@@ -499,44 +689,75 @@ function collapseRepetitions(text) {
     return words.join(' ');
 }
 
+const PROMPT_LEAK_MARKER_CHARS = 24;
+
+function stripPromptLeak(text, prompt) {
+    if (!text || !prompt) return text;
+    const trimmedPrompt = prompt.trim();
+    if (trimmedPrompt.length <= PROMPT_LEAK_MARKER_CHARS) return text;
+    const stripped = text.split(trimmedPrompt).join(' ').replace(/\s+/g, ' ').trim();
+    return stripped.includes(trimmedPrompt.slice(0, PROMPT_LEAK_MARKER_CHARS)) ? '' : stripped;
+}
+
+const DEVANAGARI_RE = /[ऀ-ॿ]/;
+const NORDIC_RE = /[ðþæøÐÞÆØ]/;
+
+function filterLanguageMismatch(text, language) {
+    if (!text || language !== 'hi') return text;
+    if (NORDIC_RE.test(text)) return '';
+    return DEVANAGARI_RE.test(text) ? text : '';
+}
+
 function filterHallucinations(text) {
     if (!text) return '';
     const trimmed = text.trim();
-    // Known Whisper decoder hallucination patterns on silence or quiet background noise
-    const hallucinationPatterns = [
-        /^thank you(\s+very\s+much)?[\.!]?$/i,
-        /^thank you for watching[\.!]?$/i,
-        /^subtitles by.*$/i,
-        /^amara\.org.*$/i,
-        /^subscribe to my channel[\.!]?$/i,
-        /^bye[\.!]?$/i,
-        /^goodbye[\.!]?$/i,
-        /^\s*you\s*[\.!]?$/i,
-        /^\s*mbc\s*[\.!]?$/i,
-        /^[.\s,!?-]+$/,
-        // Hindi / Devanagari noise hallucinations on background static
-        /^झाल[ंअा]*$/i,
-        /^छाल[ंअा]*$/i,
-        /^अ[ं०-९]?$/i,
-        /^आ[ं]?$/i,
-        /^हम्म[ं]?$/i,
-        /^सब्सक्राइब.*$/i,
-        /^[ऀ-ॿ\s]{1,3}$/,
-    ];
-    for (const pattern of hallucinationPatterns) {
-        if (pattern.test(trimmed)) {
+    for (let i = 0; i < HALLUCINATION_PATTERNS.length; i++) {
+        if (HALLUCINATION_PATTERNS[i].test(trimmed)) {
             return '';
         }
     }
     return trimmed;
 }
 
+const NORMALIZE_TARGET_RMS = 0.06;
+const NORMALIZE_MAX_GAIN = 12;
+const NORMALIZE_PEAK_CEILING = 0.97;
+
+function normalizeLevel(float32) {
+    if (float32.length === 0) return float32;
+    let sumSquares = 0;
+    let peak = 0;
+    for (let i = 0; i < float32.length; i++) {
+        const sample = float32[i];
+        sumSquares += sample * sample;
+        const magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > peak) peak = magnitude;
+    }
+    const rms = Math.sqrt(sumSquares / float32.length);
+    if (rms <= 0 || peak <= 0) return float32;
+    const gain = Math.min(NORMALIZE_TARGET_RMS / rms, NORMALIZE_MAX_GAIN, NORMALIZE_PEAK_CEILING / peak);
+    if (gain <= 1.05) return float32;
+    for (let i = 0; i < float32.length; i++) float32[i] *= gain;
+    return float32;
+}
+
+function languageOptions(pipeline, language) {
+    const generationConfig = pipeline && pipeline.model && pipeline.model.generation_config;
+    const base = { language: language || 'en', task: 'transcribe' };
+    if (!generationConfig) return base;
+    const langToId = generationConfig.lang_to_id;
+    if (langToId && Number.isInteger(langToId[`<|${base.language}|>`])) {
+        return { ...base, is_multilingual: true };
+    }
+    return generationConfig.is_multilingual === false ? null : base;
+}
+
 function pcm16ToFloat32(pcm16Buffer) {
     const samples = Math.floor(pcm16Buffer.length / 2);
-    const view = new Int16Array(pcm16Buffer.buffer, pcm16Buffer.byteOffset, samples);
+    const view = getInt16View(pcm16Buffer, samples);
     const float32 = new Float32Array(samples);
     for (let i = 0; i < samples; i++) {
-        float32[i] = view[i] / 32768;
+        float32[i] = view[i] * INV_32768;
     }
     return float32;
 }
@@ -549,7 +770,7 @@ async function transcribeAudio(pcm16kBuffer) {
 
     try {
         const startedAt = Date.now();
-        const float32Audio = pcm16ToFloat32(pcm16kBuffer);
+        const float32Audio = normalizeLevel(pcm16ToFloat32(pcm16kBuffer));
 
         let text;
         if (backend === 'ane') {
@@ -570,20 +791,29 @@ async function transcribeAudio(pcm16kBuffer) {
             }
         } else {
             // Whisper expects audio at 16kHz which is what we have
-            const result = await whisperPipeline(float32Audio, {
+            const options = {
                 sampling_rate: 16000,
-                language: whisperLanguage,
-                task: 'transcribe',
                 // Block the decoder from repeating any 3-gram — the primary guard
                 // against "this is this is this is…" loops.
                 no_repeat_ngram_size: 3,
                 condition_on_previous_text: false,
-            });
+            };
+            Object.assign(options, languageOptions(whisperPipeline, whisperLanguage));
+            const result = await whisperPipeline(float32Audio, options);
             text = result.text?.trim();
         }
 
-        text = collapseRepetitions(text);
+        const deleaked = stripPromptLeak(text, whisperContextPrompt);
+        if (text && deleaked !== text) {
+            console.warn(`[Transcriber] Bias prompt leaked into the transcript (${backend}) — stripped`);
+        }
+        text = collapseRepetitions(deleaked);
         text = filterHallucinations(text);
+        const scriptChecked = filterLanguageMismatch(text, whisperLanguage);
+        if (text && !scriptChecked) {
+            console.log(`[Transcriber] Dropping non-Devanagari output from a Hindi session (${backend}):`, text);
+        }
+        text = scriptChecked;
         console.log(`[Transcriber] Completed in ${Date.now() - startedAt}ms (${backend}):`, text);
         return text;
     } catch (error) {
@@ -616,8 +846,23 @@ async function handleSpeechEnd(audioData, generation, source) {
     }
 
     if (onTranscript) {
-        await onTranscript(transcription, { source });
+        try {
+            await onTranscript(transcription, { source });
+        } catch (error) {
+            console.error(`[Transcriber] onTranscript listener error on ${source}:`, error);
+        }
     }
+}
+
+function queueSegment(stream, frames, threshold, asSource = null) {
+    const segment = trimSegment(frames, threshold);
+    if (segment.voiced < SEGMENT_MIN_VOICED_FRAMES) {
+        console.log(`[Transcriber] Segment on ${stream.source} holds only ${segment.voiced} voiced frames — discarding`);
+        streamStatus(stream, 'Listening...');
+        return false;
+    }
+    queueTranscription(Buffer.concat(segment.frames), stream, asSource);
+    return true;
 }
 
 function queueTranscription(audioData, stream, asSource = null) {
@@ -667,10 +912,8 @@ async function initWhisper(modelName, { contextPrompt = '' } = {}) {
     // audio or silently translate it. Surface it rather than letting the user
     // conclude Hindi transcription is broken.
     if (whisperLanguage !== 'en' && /whisper-(tiny|base)$/i.test(modelName)) {
-        console.warn(
-            `[Transcriber] Model "${modelName}" is weak for language "${whisperLanguage}" — recommend whisper-large-v3-turbo or whisper-small`
-        );
-        sendToRenderer('update-status', `${modelName.split('/').pop()} is inaccurate for non-English — switch to Large v3 Turbo in settings`);
+        console.warn(`[Transcriber] Model "${modelName}" is weak for language "${whisperLanguage}" — recommend whisper-hindi-small-ONNX`);
+        sendToRenderer('update-status', `${modelName.split('/').pop()} is inaccurate for non-English — switch to Hindi Small in settings`);
     }
     return await loadWhisperPipeline(modelName);
 }
@@ -683,10 +926,11 @@ function setOnTranscript(callback) {
 // Defaults to 'speaker' so existing single-stream callers are unaffected.
 function processAudio24k(monoChunk24k, source = DEFAULT_SOURCE) {
     const stream = getStream(source);
+    const rms = calculateRMS(monoChunk24k);
     // Resample from 24kHz to 16kHz
-    const pcm16k = resample24kTo16k(monoChunk24k, stream);
+    const pcm16k = resample24kTo16k(lowpass24k(monoChunk24k, stream), stream);
     if (pcm16k.length > 0) {
-        processVAD(pcm16k, stream);
+        processVAD(pcm16k, stream, rms);
     }
 }
 
@@ -705,17 +949,20 @@ function flush(source = 'mic', { asSource = null } = {}) {
     const stream = getStream(source);
     if (stream.speechBuffers.length === 0) {
         stream.isSpeaking = false;
+        stream.speechLevel = 0;
         stream.silenceFrameCount = 0;
         stream.speechFrameCount = 0;
         return false;
     }
-    const audioData = Buffer.concat(stream.speechBuffers);
+    const segment = trimSegment(stream.speechBuffers, speechThresholds(stream).start);
     stream.speechBuffers = [];
     stream.isSpeaking = false;
+    stream.speechLevel = 0;
     stream.silenceFrameCount = 0;
     stream.speechFrameCount = 0;
     stream.lastInterimFrameCount = 0;
-    queueTranscription(audioData, stream, asSource);
+    if (segment.frames.length === 0) return false;
+    queueTranscription(Buffer.concat(segment.frames), stream, asSource);
     return true;
 }
 
@@ -739,6 +986,7 @@ function resetTranscriber() {
     transcriptionGeneration++;
     streams.clear();
     pendingAudioJobs = [];
+    lastInterimFinishedAt = 0;
     onTranscript = null;
     // Note: whisperPipeline is kept loaded to avoid reloading on next session
 }
@@ -750,4 +998,25 @@ module.exports = {
     flush,
     isPipelineBusy,
     resetTranscriber,
+    _testing: {
+        setInterimMinGapMs(ms) {
+            interimMinGapMs = ms;
+        },
+        INTERIM_MIN_GAP_MS,
+        lowpass24k,
+        resample24kTo16k,
+        calculateRMS,
+        speechThresholds,
+        updateNoiseFloor,
+        trimSegment,
+        normalizeLevel,
+        pcm16ToFloat32,
+        collapseRepetitions,
+        filterHallucinations,
+        filterLanguageMismatch,
+        stripPromptLeak,
+        languageOptions,
+        getInt16View,
+        EMPTY_BUFFER,
+    },
 };

@@ -32,6 +32,7 @@
         "ollama": "^0.6.3",
         "react": "^19.2.7",
         "react-dom": "^19.2.7",
+        "sharp": "^0.35.3",
         "ws": "^8.19.0"
     },
     "devDependencies": {

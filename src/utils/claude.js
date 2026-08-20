@@ -7,7 +7,7 @@ const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { getSystemPrompt } = require('./prompts');
+const { getSystemPrompt, profilePrompts } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn, saveScreenAnalysis } = require('./gemini');
 const transcriber = require('./transcriber');
 const storage = require('../storage');
@@ -100,11 +100,23 @@ const USER_SPEECH_CONTEXT_CHARS = 1200;
 // question is answered — the echo of a question can arrive on the mic after the
 // answer has already started.
 let recentSpeakerSpeech = [];
+let recentSpeakerSpeechSets = [];
 const RECENT_SPEAKER_MAX = 6;
 // The last answer Claude produced. In speaker (audio-only) mode the app reads
 // answers aloud, so the mic hears them; without this they would be recorded as
 // the user's own speech and fed back as context.
 let lastAnswerText = '';
+let lastAnswerSet = null;
+
+function setLastAnswerText(text) {
+    lastAnswerText = text || '';
+    if (!lastAnswerText.trim()) {
+        lastAnswerSet = null;
+    } else {
+        const words = echoTokens(lastAnswerText);
+        lastAnswerSet = words.length > 0 ? new Set(words) : null;
+    }
+}
 
 // Unless headphones are in use, the mic also picks up the interviewer coming out
 // of the laptop speakers (and, in speaker mode, the app's own spoken answer).
@@ -125,12 +137,16 @@ function looksLikeEcho(text) {
     // Under a few words the overlap ratio is noise — "yeah okay right" would
     // match almost any reference. Short mic fragments are cheap to keep.
     if (words.length < 4) return false;
-    for (const reference of [...recentSpeakerSpeech, lastAnswerText]) {
-        if (!reference) continue;
-        const referenceWords = new Set(echoTokens(reference));
-        if (referenceWords.size === 0) continue;
-        const hits = words.filter(word => referenceWords.has(word)).length;
-        if (hits / words.length >= ECHO_OVERLAP_RATIO) return true;
+    const len = words.length;
+    const targets = lastAnswerSet ? [...recentSpeakerSpeechSets, lastAnswerSet] : recentSpeakerSpeechSets;
+    for (let t = 0; t < targets.length; t++) {
+        const referenceWords = targets[t];
+        if (!referenceWords || referenceWords.size === 0) continue;
+        let hits = 0;
+        for (let i = 0; i < len; i++) {
+            if (referenceWords.has(words[i])) hits++;
+        }
+        if (hits / len >= ECHO_OVERLAP_RATIO) return true;
     }
     return false;
 }
@@ -140,8 +156,11 @@ function rememberSpeakerSpeech(text) {
     const trimmed = (text || '').trim();
     if (!trimmed) return;
     recentSpeakerSpeech.push(trimmed);
+    const words = echoTokens(trimmed);
+    recentSpeakerSpeechSets.push(words.length > 0 ? new Set(words) : null);
     if (recentSpeakerSpeech.length > RECENT_SPEAKER_MAX) {
         recentSpeakerSpeech = recentSpeakerSpeech.slice(-RECENT_SPEAKER_MAX);
+        recentSpeakerSpeechSets = recentSpeakerSpeechSets.slice(-RECENT_SPEAKER_MAX);
     }
 }
 
@@ -269,6 +288,7 @@ const API_MAX_TOKENS = 2048;
 // Structured system-design answers and on-demand expansions legitimately run
 // long — give them headroom without slowing every ordinary reply.
 const API_MAX_TOKENS_DETAILED = 4096;
+const API_MAX_TOKENS_SPOKEN = 400;
 const CLAUDE_CONCISE_RESPONSE_PROMPT = `
 
 **CLAUDE REAL-TIME RESPONSE RULES — HIGHEST PRIORITY:**
@@ -308,14 +328,21 @@ const CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT = `
 [1-2 warm, natural spoken sentences to reply out loud]
 
 💡 **Next Topic Suggestions:**
-• 🔥 **Latest:** [Region-specific trend: search web for viral regional reels/memes, new OTT/movie releases, sports, or local weekend plans]
+• 🔥 **Latest:** [Region-specific trend: viral regional reels/memes, new OTT/movie releases, sports, or local weekend plans]
 • ⏳ **Old / Nostalgic:** [Shared memory, childhood story, or deep question]
 
-- ALWAYS search the web for region-specific latest trends (e.g., India / regional trends when Hindi/Hinglish is spoken) to make 🔥 **Latest** topic suggestions fresh, trending, and locally relevant to her region.
+- 💬 **What to say** is spoken aloud verbatim by the user on a live call. It may contain ONLY words a person would say to their partner. NEVER mention searching, tools, permissions, what you can or cannot do, or anything about yourself — if you lack information, just say something natural and human instead, or ask her a normal question.
 - Reply in the same language/mix as the transcript (Hinglish stays Hinglish, English stays English).
 - In Hindi/Hinglish, use “tum” by default and never “tu.” Mirror “aap” only if she is already using it.
 - Keep the overall response short, clear, and easy to scan at a single glance during a live call.
 `;
+
+const CLAUDE_CONVERSATIONAL_SEARCH_RULE = `- Use web search for the 🔥 **Latest** suggestion so it is genuinely current and regionally relevant (e.g. India / regional trends when Hindi/Hinglish is spoken). If a search does not return in time, fall back to a plausible suggestion and never mention the search.
+`;
+
+function conversationalResponseRules() {
+    return webSearchEnabled ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT + CLAUDE_CONVERSATIONAL_SEARCH_RULE : CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT;
+}
 
 const CLAUDE_MEETING_RESPONSE_PROMPT = `
 
@@ -389,9 +416,9 @@ All shapes: bold section names, short bullets, round numbers, no intro, no closi
 // vocabulary steers ambiguous audio toward the terms actually being spoken —
 // this is what turns accented "XSS attack" into "XSS attack" instead of
 // "X? is a tag" or "six seasons". Passed to the WhisperKit sidecar as its
-// --prompt for technical profiles; conversational profiles skip it so casual
-// speech isn't dragged toward tech jargon. Keep it well under Whisper's
-// 224-token prompt window.
+// --prompt for the interview profile; every other profile skips it so speech
+// that isn't software engineering isn't dragged toward tech jargon. Keep it
+// well under Whisper's 224-token prompt window.
 const WHISPER_TECH_CONTEXT_PROMPT =
     'Software engineering interview covering: XSS, CSRF, SQL injection, OAuth, JWT, REST API, GraphQL, gRPC, frontend, backend, full-stack, ' +
     'React, Node.js, TypeScript, Python, Kubernetes, Docker, CI/CD, microservices, caching, Redis, Kafka, rate limiting, load balancer, ' +
@@ -422,15 +449,70 @@ const WHISPER_RELATIONSHIP_CONTEXT_PROMPT_HI =
     'यह एक स्वाभाविक हिंदी और हिंग्लिश बातचीत है। आम शब्द: तुम, आप, क्या, क्यों, कैसे, कहाँ, कब, आज, कल, यार, ना, ' +
     'बताना, सुनाओ, ऑफिस, काम, घर, खाना, फिल्म, गाना, रील, weekend, message, call, funny, really, okay.';
 
-// Profiles where the speaker is expected to use technical vocabulary; the
-// unknown/default profile maps to interview in prompts.js, so it counts too.
+const WHISPER_GENERAL_CONTEXT_PROMPT_HI =
+    'यह एक स्वाभाविक हिंदी और हिंग्लिश बातचीत है। आम शब्द: तुम, आप, क्या, क्यों, कैसे, कहाँ, कब, आज, कल, यार, ना, ' +
+    'बताना, सुनाओ, काम, घर, बात, फोन, शॉपिंग, मार्केट, फिल्म, गाना, रील, weekend, message, call, okay, right.';
+
+let webSearchEnabled = true;
+
+function readWebSearchPreference() {
+    try {
+        return storage.getPreferences().googleSearchEnabled === true;
+    } catch (error) {
+        console.warn('[Claude] Could not read googleSearchEnabled preference, defaulting to off:', error.message);
+        return false;
+    }
+}
+
+const CLAUDE_SPOKEN_TURN_RULES = `[SPEAKER-ONLY MODE — THIS ANSWER IS SPOKEN ALOUD, NEVER READ]
+Your reply is passed straight to a text-to-speech voice in the user's ear while they are mid-conversation. Nobody sees it. These rules override every formatting and length rule above.
+- Plain spoken prose only: no markdown, no headings, no section labels, no bullets, no numbering, no emoji, no code fences, no URLs, no parentheses, no slashes, no abbreviations like "e.g." or "i.e.".
+- One or two sentences. 30 words maximum. Answer only what was asked and stop.
+- Put the answer in the first few words. No preamble, no restating the question, no closing offer.
+- Write it the way a person says it out loud: short words, spelled-out symbols and units, numbers a voice can read.
+- For code, say the approach in one sentence instead of dictating syntax.
+- If a list is unavoidable, name at most three things joined by "then".
+`;
+
+function readSpeakerModePreference() {
+    try {
+        return storage.getPreferences().speakerMode === true;
+    } catch (error) {
+        console.warn('[Claude] Could not read speakerMode preference, defaulting to off:', error.message);
+        return false;
+    }
+}
+
+let autoAnswerEnabled = true;
+
+function readAutoAnswerPreference() {
+    try {
+        return storage.getPreferences().autoAnswer !== false;
+    } catch (error) {
+        console.warn('[Claude] Could not read autoAnswer preference, defaulting to on:', error.message);
+        return true;
+    }
+}
+
+function cliAllowedTools() {
+    return webSearchEnabled ? ['Read', 'WebSearch', 'WebFetch'] : ['Read'];
+}
+
+// Profiles whose speech is software engineering. exam and mcq are
+// subject-agnostic, so this vocabulary would drag a biology or finance question
+// toward Kafka and mutexes. Unknown profiles resolve to interview, as in
+// getSystemPrompt.
+const TECHNICAL_PROFILES = new Set(['interview']);
+
 function whisperContextPromptForProfile(profile, language = 'en') {
-    if (profile === 'relationship') {
+    const resolved = profilePrompts[profile] ? profile : 'interview';
+    if (resolved === 'relationship') {
         return language === 'hi' ? WHISPER_RELATIONSHIP_CONTEXT_PROMPT_HI : '';
     }
-    const isTechnical = !profile || profile === 'interview' || profile === 'exam' || profile === 'mcq';
-    if (!isTechnical) return '';
-    return language === 'hi' ? WHISPER_TECH_CONTEXT_PROMPT_HI : WHISPER_TECH_CONTEXT_PROMPT;
+    if (TECHNICAL_PROFILES.has(resolved)) {
+        return language === 'hi' ? WHISPER_TECH_CONTEXT_PROMPT_HI : WHISPER_TECH_CONTEXT_PROMPT;
+    }
+    return language === 'hi' ? WHISPER_GENERAL_CONTEXT_PROMPT_HI : '';
 }
 
 // Whisper hallucinates stock phrases on silence/noise (subtitle artifacts) and
@@ -467,6 +549,7 @@ const TRANSCRIPT_NOISE_PATTERNS_HI = [
 ];
 
 const DEVANAGARI_RE = /[ऀ-ॿ]/;
+const ALL_TRANSCRIPT_NOISE_PATTERNS = [...TRANSCRIPT_NOISE_PATTERNS, ...TRANSCRIPT_NOISE_PATTERNS_HI];
 
 // A meaningful turn for a real-time answer assistant is one Claude should
 // actually respond to: not pure filler, not a bare acknowledgement, and long
@@ -475,8 +558,10 @@ function isMeaningfulTranscript(text) {
     const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
     if (!normalized) return false;
     const hasDevanagari = DEVANAGARI_RE.test(normalized);
-    const patterns = hasDevanagari ? [...TRANSCRIPT_NOISE_PATTERNS, ...TRANSCRIPT_NOISE_PATTERNS_HI] : TRANSCRIPT_NOISE_PATTERNS;
-    if (patterns.some(re => re.test(normalized))) return false;
+    const patterns = hasDevanagari ? ALL_TRANSCRIPT_NOISE_PATTERNS : TRANSCRIPT_NOISE_PATTERNS;
+    for (let i = 0; i < patterns.length; i++) {
+        if (patterns[i].test(normalized)) return false;
+    }
     // Single-word, non-question fragments are almost always filler or noise.
     // Hindi output rarely carries a "?" (Whisper ends the sentence with "।"),
     // so an interrogative word counts as a question marker there instead.
@@ -593,6 +678,13 @@ function queueTranscript(transcription) {
             );
         return;
     }
+    if (!autoAnswerEnabled) {
+        console.log('[Claude] Auto answer off — transcript kept as context only:', heard.substring(0, 60));
+        sendToRenderer('new-transcript', heard);
+        sendToRenderer('update-status', `Auto answer off — press ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G to answer`);
+        return;
+    }
+
     pendingTranscripts.push(transcription);
     if (pendingTranscripts.length === 1) pendingFirstQueuedAt = Date.now();
 
@@ -861,6 +953,7 @@ async function resolveClaudeCli() {
 // to the SDK instead of re-probing the filesystem per question.
 async function ensureCliResolved() {
     if (cliPath) return { path: cliPath, env: cliEnv };
+    if (cliUnavailable) return null;
     if (cliResolutionPromise) return cliResolutionPromise;
     cliResolutionPromise = (async () => {
         const startedAt = Date.now();
@@ -1043,8 +1136,8 @@ async function runClaudeCli(prompt, { allowedTools, quiet = false, timeoutMs = C
         if (cliSessionId) {
             args.push('--resume', cliSessionId);
         }
-        if (allowedTools) {
-            args.push('--allowedTools', allowedTools);
+        if (allowedTools && allowedTools.length) {
+            args.push('--allowedTools', ...(Array.isArray(allowedTools) ? allowedTools : [allowedTools]));
         }
 
         console.log('[Claude] Spawning one-shot CLI', cliSessionId ? '(resume session)' : '(new session)');
@@ -1110,9 +1203,10 @@ async function runClaudeCli(prompt, { allowedTools, quiet = false, timeoutMs = C
         proc.stdout.on('data', data => {
             sawAnyStdout = true;
             lineBuffer += data.toString();
-            const lines = lineBuffer.split('\n');
-            lineBuffer = lines.pop(); // keep trailing partial line
-            for (const line of lines) {
+            let nlIdx;
+            while ((nlIdx = lineBuffer.indexOf('\n')) !== -1) {
+                const line = lineBuffer.slice(0, nlIdx);
+                lineBuffer = lineBuffer.slice(nlIdx + 1);
                 if (!line.trim()) continue;
                 let event;
                 try {
@@ -1240,7 +1334,7 @@ function spawnPersistentProc() {
     if (currentSystemPrompt) {
         args.push('--system-prompt', currentSystemPrompt);
     }
-    args.push('--allowedTools', 'Read');
+    args.push('--allowedTools', ...cliAllowedTools());
     if (cliSessionId) {
         args.push('--resume', cliSessionId);
     }
@@ -1255,9 +1349,10 @@ function spawnPersistentProc() {
     let lineBuffer = ''; // per-process: a dying process must not corrupt its successor's buffer
     proc.stdout.on('data', data => {
         lineBuffer += data.toString();
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop();
-        for (const line of lines) {
+        let nlIdx;
+        while ((nlIdx = lineBuffer.indexOf('\n')) !== -1) {
+            const line = lineBuffer.slice(0, nlIdx);
+            lineBuffer = lineBuffer.slice(nlIdx + 1);
             if (!line.trim()) continue;
             let event;
             try {
@@ -1509,10 +1604,11 @@ async function runClaudeQuery(prompt, { quiet = false, timeoutMs = QUERY_TIMEOUT
             includePartialMessages: true,
             // Favor immediate answers over extended reasoning in the real-time
             // assistant. Users can still select a more capable model.
-            maxThinkingTokens: 0,
-            // Plain text answers do not need Claude Code's tools or user MCP
-            // servers. Skipping their discovery reduces request startup work.
-            allowedTools: [],
+            maxThinkingTokens: 1000,
+            // Plain text answers need no tools beyond the web search the user
+            // opted into, and no user MCP servers. Skipping their discovery
+            // reduces request startup work.
+            allowedTools: webSearchEnabled ? ['WebSearch', 'WebFetch'] : [],
             mcpServers: {},
             strictMcpConfig: true,
             // Pin a clean working directory so Claude Code doesn't scan the
@@ -1656,14 +1752,46 @@ async function streamAnthropicMessages(messages, { maxTokens = API_MAX_TOKENS } 
 
     let fullText = '';
     let isFirst = true;
+    let lastSentText = '';
+    let lastEmitAt = 0;
+    let emitTimer = null;
 
-    stream.on('text', delta => {
-        fullText += delta;
+    const emitUpdate = force => {
+        if (!fullText || fullText === lastSentText) return;
+        const elapsed = Date.now() - lastEmitAt;
+        if (!force && elapsed < RESPONSE_UPDATE_INTERVAL_MS) {
+            if (!emitTimer) {
+                emitTimer = setTimeout(() => {
+                    emitTimer = null;
+                    emitUpdate(true);
+                }, RESPONSE_UPDATE_INTERVAL_MS - elapsed);
+            }
+            return;
+        }
+        if (emitTimer) {
+            clearTimeout(emitTimer);
+            emitTimer = null;
+        }
         sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
         isFirst = false;
-    });
+        lastSentText = fullText;
+        lastEmitAt = Date.now();
+    };
 
-    await stream.finalMessage();
+    try {
+        stream.on('text', delta => {
+            fullText += delta;
+            emitUpdate(false);
+        });
+
+        await stream.finalMessage();
+        emitUpdate(true);
+    } finally {
+        if (emitTimer) {
+            clearTimeout(emitTimer);
+            emitTimer = null;
+        }
+    }
     return fullText;
 }
 
@@ -1692,17 +1820,19 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
     const initStartedAt = Date.now();
     try {
         claudeMode = mode === 'api' ? 'api' : 'cli';
+        webSearchEnabled = readWebSearchPreference();
         const realtimeRules =
             profile === 'relationship'
-                ? CLAUDE_CONVERSATIONAL_RESPONSE_PROMPT
+                ? conversationalResponseRules()
                 : profile === 'meeting'
                   ? CLAUDE_MEETING_RESPONSE_PROMPT
                   : CLAUDE_CONCISE_RESPONSE_PROMPT;
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false) + realtimeRules;
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, webSearchEnabled) + realtimeRules;
         claudeConversationHistory = [];
         unsentUserSpeech = [];
         recentSpeakerSpeech = [];
-        lastAnswerText = '';
+        recentSpeakerSpeechSets = [];
+        setLastAnswerText('');
         cliSessionId = null;
         isTransportReady = false;
         // A leftover process carries the previous session's model/system
@@ -1771,8 +1901,17 @@ async function initializeClaudeSession(mode, { anthropicApiKey, model, whisperMo
         // any speech heard before it finishes queues until the transport is ready.
         isClaudeActive = true;
         isAudioMuted = false;
+        autoAnswerEnabled = readAutoAnswerPreference();
+        sendToRenderer('auto-answer-toggled', autoAnswerEnabled);
         sendToRenderer('session-initializing', false);
-        sendToRenderer('update-status', isTransportReady ? 'Claude ready - Listening...' : 'Listening... (Claude preparing)');
+        sendToRenderer(
+            'update-status',
+            !autoAnswerEnabled
+                ? `Auto answer off — press ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G to answer`
+                : isTransportReady
+                  ? 'Claude ready - Listening...'
+                  : 'Listening... (Claude preparing)'
+        );
 
         console.log(`[Claude] Session initialized in ${claudeMode} mode in ${Date.now() - initStartedAt}ms (transport ready: ${isTransportReady})`);
         return true;
@@ -1802,6 +1941,28 @@ function toggleAudioMute() {
 
 function isAudioMutedState() {
     return isAudioMuted;
+}
+
+function toggleAutoAnswer() {
+    autoAnswerEnabled = !autoAnswerEnabled;
+    console.log('[Claude] Auto answer toggled:', autoAnswerEnabled);
+    try {
+        storage.updatePreference('autoAnswer', autoAnswerEnabled);
+    } catch (error) {
+        console.warn('[Claude] Could not persist autoAnswer preference:', error.message);
+    }
+    sendToRenderer('auto-answer-toggled', autoAnswerEnabled);
+    if (autoAnswerEnabled) {
+        if (isClaudeActive && pendingTranscripts.length > 0) scheduleFlush();
+        sendToRenderer('update-status', 'Auto answer on — Listening...');
+    } else {
+        sendToRenderer('update-status', `Auto answer off — press ${process.platform === 'darwin' ? 'Cmd' : 'Ctrl'}+Shift+G to answer`);
+    }
+    return autoAnswerEnabled;
+}
+
+function isAutoAnswerEnabled() {
+    return autoAnswerEnabled;
 }
 
 // Push-to-talk: open the mic gate while the user is holding/toggling the
@@ -1864,9 +2025,11 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
     // for wrapped prompts like answerWithContext); the injected rules are
     // never saved or recorded — they are instructions, not conversation.
     const questionText = recordAsQuestion === null ? null : recordAsQuestion || trimmed;
-    const isDesignTurn = !!(questionText && isSystemDesignQuestion(questionText));
+    const spokenTurn = !detailed && readSpeakerModePreference();
+    const isDesignTurn = !spokenTurn && !!(questionText && isSystemDesignQuestion(questionText));
     if (isDesignTurn) console.log('[Claude] System design question detected — structured answer mode');
-    const outgoing = isDesignTurn ? SYSTEM_DESIGN_TURN_RULES + '\n\n' + trimmed : trimmed;
+    if (spokenTurn) console.log('[Claude] Speaker-only mode — spoken-brevity answer requested');
+    const outgoing = spokenTurn ? CLAUDE_SPOKEN_TURN_RULES + '\n\n' + trimmed : isDesignTurn ? SYSTEM_DESIGN_TURN_RULES + '\n\n' + trimmed : trimmed;
 
     if (claudeMode === 'cli') {
         // The installed CLI is authoritative for text requests. On a lost
@@ -1878,9 +2041,9 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
         if (cliUnavailable) {
             result = { success: false, error: 'Claude CLI not found' };
         } else {
-            result = await runCliTransport(outgoing);
+            result = await runCliTransport(outgoing, { allowedTools: cliAllowedTools() });
             if (retryWithFreshSession(result)) {
-                result = await runCliTransport(outgoing);
+                result = await runCliTransport(outgoing, { allowedTools: cliAllowedTools() });
             }
         }
         if (!result.success && result.error !== 'Cancelled') {
@@ -1896,7 +2059,7 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
             // the user's-own-speech context block or a manual-override preamble;
             // the saved history and the History view want what was actually asked.
             saveConversationTurn(questionText || trimmed, result.text);
-            lastAnswerText = result.text;
+            setLastAnswerText(result.text);
             if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
         sendToRenderer('response-complete'); // reveal the finished answer in the UI
@@ -1910,7 +2073,7 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
 
     try {
         const fullText = await streamAnthropicMessages(claudeConversationHistory, {
-            maxTokens: detailed || isDesignTurn ? API_MAX_TOKENS_DETAILED : API_MAX_TOKENS,
+            maxTokens: detailed || isDesignTurn ? API_MAX_TOKENS_DETAILED : spokenTurn ? API_MAX_TOKENS_SPOKEN : API_MAX_TOKENS,
         });
 
         // Keep the clean question in history — the injected framework rules
@@ -1922,7 +2085,7 @@ async function sendClaudeText(text, { recordAsQuestion = text, detailed = false 
         if (fullText.trim()) {
             claudeConversationHistory.push({ role: 'assistant', content: fullText.trim() });
             saveConversationTurn(questionText || trimmed, fullText);
-            lastAnswerText = fullText.trim();
+            setLastAnswerText(fullText.trim());
             if (recordAsQuestion && recordAsQuestion.trim()) lastAnsweredQuestion = recordAsQuestion.trim();
         }
 
@@ -1950,15 +2113,15 @@ async function sendClaudeImage(base64Data, prompt) {
         // The CLI can't take inline images, but it can Read image files. The
         // persistent session is spawned with Read allowed, so this rides the
         // warm process too; the one-shot fallback passes allowedTools itself.
-        const tmpPath = path.join(os.tmpdir(), `cd-screen-${Date.now()}.jpg`);
+        const tmpPath = path.join(os.tmpdir(), `cd-screen-${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`);
         try {
-            fs.writeFileSync(tmpPath, Buffer.from(base64Data, 'base64'));
+            await fs.promises.writeFile(tmpPath, Buffer.from(base64Data, 'base64'));
             let result = await runCliTransport(`Read and analyze the image at ${tmpPath}. ${prompt}`, {
-                allowedTools: 'Read',
+                allowedTools: ['Read'],
             });
             if (retryWithFreshSession(result)) {
                 result = await runCliTransport(`Read and analyze the image at ${tmpPath}. ${prompt}`, {
-                    allowedTools: 'Read',
+                    allowedTools: ['Read'],
                 });
             }
             if (result.success && result.text) {
@@ -1968,7 +2131,7 @@ async function sendClaudeImage(base64Data, prompt) {
             return result;
         } finally {
             try {
-                fs.unlinkSync(tmpPath);
+                await fs.promises.unlink(tmpPath);
             } catch (cleanupError) {
                 // Temp file already gone
             }
@@ -2028,7 +2191,8 @@ function closeClaudeSession() {
     recentHeardTranscripts = [];
     unsentUserSpeech = [];
     recentSpeakerSpeech = [];
-    lastAnswerText = '';
+    recentSpeakerSpeechSets = [];
+    setLastAnswerText('');
     lastAnsweredQuestion = null;
     isTranscriptResponseInFlight = false;
     lastSentTranscriptTurn = null;
@@ -2067,6 +2231,8 @@ module.exports = {
     processClaudeAudio,
     toggleAudioMute,
     isAudioMutedState,
+    toggleAutoAnswer,
+    isAutoAnswerEnabled,
     setPushToTalk,
     sendClaudeText,
     sendClaudeImage,
@@ -2082,6 +2248,19 @@ module.exports = {
 // the module keeps its state in closures — this gives tests a controlled way
 // in without touching production behavior.
 module.exports._testing = {
+    cliAllowedTools,
+    readWebSearchPreference,
+    setWebSearchEnabledForTests(enabled) {
+        webSearchEnabled = enabled;
+    },
+    readAutoAnswerPreference,
+    readSpeakerModePreference,
+    CLAUDE_SPOKEN_TURN_RULES,
+    toggleAutoAnswer,
+    isAutoAnswerEnabled,
+    setAutoAnswerForTests(enabled) {
+        autoAnswerEnabled = enabled;
+    },
     isMeaningfulTranscript,
     isSystemDesignQuestion,
     nextFlushDelay,
@@ -2130,6 +2309,7 @@ module.exports._testing = {
         cliUnavailable = false;
         cliResolutionPromise = null;
         isTransportReady = false;
+        autoAnswerEnabled = true;
         claudeMode = 'cli';
         _queryFn = null;
         persistentDisabled = false;

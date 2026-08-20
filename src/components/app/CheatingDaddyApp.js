@@ -1,4 +1,4 @@
-import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
+import { html, css, nothing, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 import { MainView } from '../views/MainView.js';
 import { CustomizeView } from '../views/CustomizeView.js';
 import { HelpView } from '../views/HelpView.js';
@@ -20,6 +20,33 @@ export class CheatingDaddyApp extends LitElement {
         }
 
         :host {
+            --shell-veil: rgba(9, 9, 11, 0.72);
+            --shell-veil-strong: rgba(9, 9, 11, 0.86);
+            --shell-hairline: rgba(255, 255, 255, 0.07);
+            --shell-hairline-strong: rgba(255, 255, 255, 0.16);
+            --shell-ink: #ededed;
+            --shell-ink-dim: #9a9a9a;
+            --shell-ink-faint: #7c7c7c;
+            --shell-signal: #7aa2f7;
+            --shell-signal-warm: #d98a5f;
+
+            --shell-space-1: 4px;
+            --shell-space-2: 8px;
+            --shell-space-3: 12px;
+            --shell-space-4: 16px;
+            --shell-space-5: 24px;
+            --shell-space-6: 40px;
+
+            --shell-micro: 11px;
+            --shell-label: 13px;
+            --shell-body: 15px;
+            --shell-display: 24px;
+
+            --shell-hud-h: 32px;
+            --shell-hud-h-slim: 14px;
+            --shell-rail: 2px;
+            --shell-motion: 180ms cubic-bezier(0.2, 0, 0, 1);
+
             display: block;
             width: 100%;
             height: 100vh;
@@ -62,8 +89,8 @@ export class CheatingDaddyApp extends LitElement {
         .traffic-lights {
             display: flex;
             align-items: center;
-            gap: 8px;
-            padding: 0 var(--space-md);
+            gap: var(--shell-space-2);
+            padding: 0 var(--shell-space-4);
             height: 100%;
             -webkit-app-region: no-drag;
         }
@@ -75,11 +102,16 @@ export class CheatingDaddyApp extends LitElement {
             border: none;
             cursor: pointer;
             padding: 0;
-            transition: opacity 0.15s ease;
+            transition: opacity var(--shell-motion);
         }
 
         .traffic-light:hover {
             opacity: 0.8;
+        }
+
+        .traffic-light:focus-visible {
+            outline: var(--shell-rail) solid var(--shell-signal);
+            outline-offset: var(--shell-space-1);
         }
 
         .traffic-light.close {
@@ -97,16 +129,16 @@ export class CheatingDaddyApp extends LitElement {
         .sidebar {
             width: var(--sidebar-width);
             min-width: var(--sidebar-width);
-            background: rgba(24, 24, 27, 0.4);
+            background: var(--shell-veil);
             backdrop-filter: var(--blur-backdrop);
-            border-right: 1px solid var(--border);
+            border-right: 1px solid var(--shell-hairline);
             display: flex;
             flex-direction: column;
-            padding: 42px 0 var(--space-md) 0;
+            padding: var(--shell-space-6) 0 var(--shell-space-4) 0;
             transition:
-                width var(--transition),
-                min-width var(--transition),
-                opacity var(--transition);
+                width var(--shell-motion),
+                min-width var(--shell-motion),
+                opacity var(--shell-motion);
         }
 
         .sidebar.hidden {
@@ -119,127 +151,140 @@ export class CheatingDaddyApp extends LitElement {
         }
 
         .sidebar-brand {
-            padding: var(--space-sm) var(--space-lg);
-            padding-top: var(--space-md);
-            margin-bottom: var(--space-lg);
+            display: flex;
+            align-items: center;
+            gap: var(--shell-space-3);
+            padding: var(--shell-space-2) var(--shell-space-5);
+            margin-bottom: var(--shell-space-5);
+        }
+
+        .sidebar-brand::before {
+            content: '';
+            width: var(--shell-rail);
+            height: var(--shell-display);
+            background: var(--shell-signal);
+            border-radius: 1px;
         }
 
         .sidebar-brand h1 {
-            font-size: var(--font-size-md);
-            font-weight: var(--font-weight-bold);
-            background: var(--accent-gradient);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.01em;
+            font-size: var(--shell-display);
+            font-weight: var(--font-weight-semibold);
+            letter-spacing: var(--tracking-tight);
+            color: var(--shell-ink);
+            line-height: var(--line-height-tight);
         }
 
         .sidebar-nav {
             flex: 1;
             display: flex;
             flex-direction: column;
-            gap: var(--space-xs);
-            padding: 0 var(--space-sm);
+            gap: var(--shell-space-1);
+            padding: 0 var(--shell-space-2);
             -webkit-app-region: no-drag;
         }
 
         .nav-item {
+            position: relative;
             display: flex;
             align-items: center;
-            gap: var(--space-sm);
-            padding: var(--space-sm) var(--space-md);
-            border-radius: var(--radius-md);
-            color: var(--text-secondary);
-            font-size: var(--font-size-sm);
+            gap: var(--shell-space-3);
+            padding: var(--shell-space-2) var(--shell-space-3);
+            border-radius: var(--radius-sm);
+            color: var(--shell-ink-dim);
+            font-size: var(--shell-label);
             font-weight: var(--font-weight-medium);
             cursor: pointer;
-            transition: all var(--transition);
-            border: 1px solid transparent;
+            transition:
+                color var(--shell-motion),
+                background var(--shell-motion);
+            border: none;
             background: none;
             width: 100%;
             text-align: left;
         }
 
+        .nav-item::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 50%;
+            width: var(--shell-rail);
+            height: 0;
+            background: var(--shell-signal);
+            border-radius: 1px;
+            transform: translateY(-50%);
+            transition: height var(--shell-motion);
+        }
+
         .nav-item:hover {
-            color: var(--text-primary);
-            background: rgba(255, 255, 255, 0.05);
-            border-color: rgba(255, 255, 255, 0.1);
-            transform: translateX(4px);
+            color: var(--shell-ink);
+            background: var(--shell-hairline);
+        }
+
+        .nav-item:focus-visible {
+            outline: 1px solid var(--shell-signal);
+            outline-offset: -1px;
+            color: var(--shell-ink);
         }
 
         .nav-item.active {
-            color: var(--text-primary);
-            background: rgba(99, 102, 241, 0.15);
-            border-color: rgba(99, 102, 241, 0.3);
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.1);
+            color: var(--shell-ink);
+            background: var(--shell-hairline);
+        }
+
+        .nav-item.active::before {
+            height: 60%;
         }
 
         .nav-item svg {
-            width: 20px;
-            height: 20px;
+            width: 18px;
+            height: 18px;
             flex-shrink: 0;
         }
 
         .sidebar-footer {
-            padding: var(--space-sm);
-            margin-top: var(--space-sm);
+            padding: var(--shell-space-2);
+            margin-top: var(--shell-space-2);
             -webkit-app-region: no-drag;
         }
 
         .update-btn {
             display: flex;
             align-items: center;
-            gap: var(--space-sm);
+            gap: var(--shell-space-2);
             width: 100%;
-            padding: var(--space-sm) var(--space-md);
-            border-radius: var(--radius-md);
-            border: 1px solid rgba(239, 68, 68, 0.2);
-            background: rgba(239, 68, 68, 0.08);
-            color: var(--danger);
-            font-size: var(--font-size-sm);
+            padding: var(--shell-space-2) var(--shell-space-3);
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--shell-hairline-strong);
+            background: none;
+            color: var(--shell-ink-dim);
+            font-size: var(--shell-label);
             font-weight: var(--font-weight-medium);
             cursor: pointer;
             text-align: left;
             transition:
-                background var(--transition),
-                border-color var(--transition);
-            animation: update-wobble 5s ease-in-out infinite;
+                color var(--shell-motion),
+                border-color var(--shell-motion);
         }
 
-        .update-btn:hover {
-            background: rgba(239, 68, 68, 0.14);
-            border-color: rgba(239, 68, 68, 0.35);
-        }
-
-        @keyframes update-wobble {
-            0%,
-            90%,
-            100% {
-                transform: rotate(0deg);
-            }
-            92% {
-                transform: rotate(-2deg);
-            }
-            94% {
-                transform: rotate(2deg);
-            }
-            96% {
-                transform: rotate(-1.5deg);
-            }
-            98% {
-                transform: rotate(1.5deg);
-            }
+        .update-btn:hover,
+        .update-btn:focus-visible {
+            color: var(--shell-ink);
+            border-color: var(--shell-signal);
+            outline: none;
         }
 
         .update-btn svg {
-            width: 20px;
-            height: 20px;
+            width: 16px;
+            height: 16px;
             flex-shrink: 0;
         }
 
         .version-text {
-            font-size: var(--font-size-xs);
-            color: var(--text-muted);
-            padding: var(--space-xs) var(--space-md);
+            font-family: var(--font-mono);
+            font-size: var(--shell-micro);
+            color: var(--shell-ink-faint);
+            padding: var(--shell-space-1) var(--shell-space-3);
         }
 
         /* ── Main content area ── */
@@ -255,91 +300,236 @@ export class CheatingDaddyApp extends LitElement {
             background-color: transparent;
         }
 
-        /* Live mode top bar */
-        .live-bar {
-            position: relative;
+        .hud {
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            padding: 0 var(--space-md);
-            background: rgba(24, 24, 27, 0.65);
+            gap: var(--shell-space-3);
+            height: var(--shell-hud-h);
+            padding: 0 var(--shell-space-3);
+            background: var(--shell-veil);
             backdrop-filter: var(--blur-backdrop);
-            border-bottom: 1px solid var(--border);
-            height: 48px;
+            border-bottom: 1px solid var(--shell-hairline);
+            overflow: hidden;
             -webkit-app-region: drag;
+            transition: height var(--shell-motion);
         }
 
-        .live-bar-left {
+        .hud-lead {
             display: flex;
             align-items: center;
+            gap: var(--shell-space-2);
+            flex-shrink: 0;
             -webkit-app-region: no-drag;
-            z-index: 1;
         }
 
-        .live-bar-back {
+        .hud-back {
             display: flex;
             align-items: center;
             justify-content: center;
-            color: var(--text-muted);
+            color: var(--shell-ink-faint);
             cursor: pointer;
             background: none;
             border: none;
-            padding: var(--space-xs);
+            padding: var(--shell-space-1);
             border-radius: var(--radius-sm);
-            transition: color var(--transition);
+            transition: color var(--shell-motion);
         }
 
-        .live-bar-back:hover {
-            color: var(--text-primary);
+        .hud-back:hover {
+            color: var(--shell-ink);
         }
 
-        .live-bar-back svg {
+        .hud-back:focus-visible {
+            outline: 1px solid var(--shell-signal);
+            color: var(--shell-ink);
+        }
+
+        .hud-back svg {
             width: 14px;
             height: 14px;
         }
 
-        .live-bar-center {
-            position: absolute;
-            left: 50%;
-            transform: translateX(-50%);
-            font-size: var(--font-size-xs);
-            color: var(--text-muted);
-            font-weight: var(--font-weight-medium);
+        .hud-state {
+            display: flex;
+            align-items: center;
+            gap: var(--shell-space-2);
+            font-family: var(--font-mono);
+            font-size: var(--shell-micro);
+            letter-spacing: var(--tracking-wide);
+            text-transform: uppercase;
+            color: var(--shell-ink-dim);
             white-space: nowrap;
+        }
+
+        .hud-state::before {
+            content: '';
+            width: var(--shell-rail);
+            height: var(--shell-space-4);
+            background: var(--shell-signal);
+            border-radius: 1px;
+        }
+
+        .hud-state[data-state='paused']::before,
+        .hud-state[data-state='manual']::before {
+            background: var(--shell-signal-warm);
+        }
+
+        .hud-meta {
+            display: flex;
+            align-items: baseline;
+            gap: var(--shell-space-3);
+            flex: 1;
+            min-width: 0;
+            font-family: var(--font-mono);
+            font-size: var(--shell-micro);
+            color: var(--shell-ink-faint);
+        }
+
+        .hud-status {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--shell-ink-dim);
+        }
+
+        .hud-clock {
+            flex-shrink: 0;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .hud-tools {
+            display: flex;
+            align-items: center;
+            gap: var(--shell-space-1);
+            flex-shrink: 0;
+            -webkit-app-region: no-drag;
+        }
+
+        .chip {
+            display: flex;
+            align-items: center;
+            gap: var(--shell-space-1);
+            padding: var(--shell-space-1) var(--shell-space-2);
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            background: none;
+            color: var(--shell-ink-faint);
+            font-family: var(--font-mono);
+            font-size: var(--shell-micro);
+            letter-spacing: var(--tracking-wide);
+            text-transform: uppercase;
+            white-space: nowrap;
+            cursor: pointer;
+            transition:
+                color var(--shell-motion),
+                border-color var(--shell-motion),
+                background var(--shell-motion);
+        }
+
+        .chip svg {
+            width: 13px;
+            height: 13px;
+            flex-shrink: 0;
+        }
+
+        .chip:hover {
+            color: var(--shell-ink);
+            background: var(--shell-hairline);
+            border-color: var(--shell-hairline-strong);
+        }
+
+        .chip:focus-visible {
+            outline: none;
+            color: var(--shell-ink);
+            border-color: var(--shell-signal);
+        }
+
+        .chip[data-alert] {
+            color: var(--shell-signal-warm);
+        }
+
+        .chip[data-alert]:hover {
+            color: var(--shell-signal-warm);
+            background: var(--shell-hairline);
+        }
+
+        :host([stealth]) {
+            --line-height-relaxed: 1.7;
+        }
+
+        :host([stealth]) .hud {
+            height: var(--shell-hud-h-slim);
+            padding: 0 var(--shell-space-2);
+            border-bottom-color: transparent;
+            background: transparent;
+        }
+
+        :host([stealth]) .hud-back,
+        :host([stealth]) .hud-tools,
+        :host([stealth]) .hud-status {
+            opacity: 0;
             pointer-events: none;
         }
 
-        .live-bar-right {
-            display: flex;
-            align-items: center;
-            gap: var(--space-md);
-            -webkit-app-region: no-drag;
-            z-index: 1;
+        :host([stealth]) .hud:hover,
+        :host([stealth]) .hud:focus-within {
+            height: var(--shell-hud-h);
+            padding: 0 var(--shell-space-3);
+            background: var(--shell-veil-strong);
+            border-bottom-color: var(--shell-hairline);
         }
 
-        .live-bar-text {
-            font-size: var(--font-size-xs);
-            color: var(--text-muted);
-            font-family: var(--font-mono);
-            white-space: nowrap;
+        :host([stealth]) .hud:hover .hud-back,
+        :host([stealth]) .hud:hover .hud-tools,
+        :host([stealth]) .hud:hover .hud-status,
+        :host([stealth]) .hud:focus-within .hud-back,
+        :host([stealth]) .hud:focus-within .hud-tools,
+        :host([stealth]) .hud:focus-within .hud-status {
+            opacity: 1;
+            pointer-events: auto;
         }
 
-        .live-bar-text.clickable {
-            cursor: pointer;
-            transition: color var(--transition);
+        :host([stealth]) .content {
+            background-image: none;
         }
 
-        .live-bar-text.clickable:hover {
-            color: var(--text-primary);
+        :host([stealth]) .hud-state {
+            font-size: 0;
+            gap: 0;
         }
 
-        .live-bar-text.muted {
-            color: var(--error-color);
+        :host([stealth]) .hud:hover .hud-state,
+        :host([stealth]) .hud:focus-within .hud-state {
+            font-size: var(--shell-micro);
+            gap: var(--shell-space-2);
         }
 
-        .live-bar-text.muted:hover {
-            color: var(--error-color);
-            opacity: 0.8;
+        @media (max-width: 460px) {
+            .hud-status {
+                display: none;
+            }
+
+            .chip-label {
+                display: none;
+            }
+        }
+
+        @media (max-width: 360px) {
+            .hud-state {
+                font-size: 0;
+                gap: 0;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .hud,
+            .chip,
+            .nav-item,
+            .nav-item::before,
+            .sidebar,
+            .update-btn {
+                transition: none;
+            }
         }
 
         /* Content inner */
@@ -373,12 +563,12 @@ export class CheatingDaddyApp extends LitElement {
         }
 
         ::-webkit-scrollbar-thumb {
-            background: var(--border-strong);
+            background: var(--shell-hairline-strong);
             border-radius: 3px;
         }
 
         ::-webkit-scrollbar-thumb:hover {
-            background: #444444;
+            background: var(--shell-ink-faint);
         }
     `;
 
@@ -401,6 +591,7 @@ export class CheatingDaddyApp extends LitElement {
         _viewInstances: { type: Object, state: true },
         _isClickThrough: { state: true },
         _isAudioMuted: { state: true },
+        _autoAnswer: { state: true },
         _isResponseStreaming: { state: true },
         _awaitingNewResponse: { state: true },
         shouldAnimateResponse: { type: Boolean },
@@ -408,6 +599,7 @@ export class CheatingDaddyApp extends LitElement {
         _updateAvailable: { state: true },
         _whisperDownloading: { state: true },
         _speakerMode: { state: true },
+        stealthMode: { type: Boolean, reflect: true, attribute: 'stealth' },
     };
 
     constructor() {
@@ -431,6 +623,7 @@ export class CheatingDaddyApp extends LitElement {
         this._viewInstances = new Map();
         this._isClickThrough = false;
         this._isAudioMuted = false;
+        this._autoAnswer = true;
         this._isResponseStreaming = false;
         this._awaitingNewResponse = false;
         this._currentResponseIsComplete = true;
@@ -442,11 +635,14 @@ export class CheatingDaddyApp extends LitElement {
         this._updateAvailable = false;
         this._whisperDownloading = false;
         this._localVersion = '';
+        this.stealthMode = false;
 
         // Speaker (audio-only) mode: window hidden, answers spoken aloud.
         this._speakerMode = false;
         this._ttsDebounceTimer = null;
         this._lastSpokenText = null;
+        this._cachedVoice = null;
+        this._voiceCacheKey = null;
 
         this._loadFromStorage();
         this._checkForUpdates();
@@ -486,6 +682,8 @@ export class CheatingDaddyApp extends LitElement {
             this.selectedImageQuality = prefs.selectedImageQuality || 'medium';
             this.layoutMode = config.layout || 'normal';
             this._speakerMode = prefs.speakerMode ?? false;
+            this._autoAnswer = prefs.autoAnswer ?? true;
+            this.stealthMode = prefs.stealthMode ?? false;
 
             this._storageLoaded = true;
             this.requestUpdate();
@@ -498,6 +696,14 @@ export class CheatingDaddyApp extends LitElement {
 
     connectedCallback() {
         super.connectedCallback();
+
+        if (window.speechSynthesis) {
+            window.speechSynthesis.getVoices();
+            window.speechSynthesis.onvoiceschanged = () => {
+                this._cachedVoice = null;
+                this._voiceCacheKey = null;
+            };
+        }
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
@@ -580,7 +786,11 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('audio-muted-toggled', (_, muted) => {
                 this._isAudioMuted = muted;
             });
+            ipcRenderer.on('auto-answer-toggled', (_, enabled) => {
+                this._autoAnswer = enabled;
+            });
             ipcRenderer.on('audio-mute-shortcut', () => this.handleToggleAudio());
+            ipcRenderer.on('toggle-auto-answer-shortcut', () => this.handleToggleAutoAnswer());
             ipcRenderer.on('toggle-speaker-mode-shortcut', () => this.toggleSpeakerMode());
             ipcRenderer.on('reconnect-failed', (_, data) => this.addNewResponse(data.message));
             ipcRenderer.on('whisper-downloading', (_, downloading) => {
@@ -604,7 +814,9 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
             ipcRenderer.removeAllListeners('audio-muted-toggled');
+            ipcRenderer.removeAllListeners('auto-answer-toggled');
             ipcRenderer.removeAllListeners('audio-mute-shortcut');
+            ipcRenderer.removeAllListeners('toggle-auto-answer-shortcut');
             ipcRenderer.removeAllListeners('reconnect-failed');
             ipcRenderer.removeAllListeners('whisper-downloading');
         }
@@ -731,6 +943,35 @@ export class CheatingDaddyApp extends LitElement {
         await ipcRenderer.invoke('toggle-audio-mute');
     }
 
+    async handleToggleAutoAnswer() {
+        if (!window.require) return;
+        if (!this.sessionActive) {
+            this._autoAnswer = !this._autoAnswer;
+            await cheatingDaddy.storage.updatePreference('autoAnswer', this._autoAnswer);
+            cheatingDaddy.refreshPreferencesCache();
+            this.setStatus(this._autoAnswer ? 'Auto answer on' : 'Auto answer off');
+            return;
+        }
+        const { ipcRenderer } = window.require('electron');
+        const result = await ipcRenderer.invoke('toggle-auto-answer');
+        if (result && result.success) {
+            this._autoAnswer = result.enabled;
+            cheatingDaddy.refreshPreferencesCache();
+            if (this._speakerMode) {
+                this._stopSpeaking();
+                this._speak(this._autoAnswer ? 'Auto answer on.' : 'Auto answer off.');
+            }
+        } else if (result && result.error) {
+            this.setStatus(result.error);
+        }
+    }
+
+    async toggleStealth() {
+        this.stealthMode = !this.stealthMode;
+        await cheatingDaddy.storage.updatePreference('stealthMode', this.stealthMode);
+        this.requestUpdate();
+    }
+
     async handleAnswerNow() {
         if (!this.sessionActive || !window.require) return;
         const { ipcRenderer } = window.require('electron');
@@ -816,14 +1057,81 @@ export class CheatingDaddyApp extends LitElement {
             const plain = this._toPlainSpeech(text);
             if (!plain) return;
             synth.cancel(); // stop anything mid-sentence before the new answer
-            const utter = new SpeechSynthesisUtterance(plain);
-            utter.rate = 1.05;
-            utter.pitch = 1.0;
-            utter.volume = 1.0;
-            synth.speak(utter);
+            const voice = this._pickVoice();
+            for (const sentence of this._toSpokenChunks(plain)) {
+                const utter = new SpeechSynthesisUtterance(sentence);
+                if (voice) utter.voice = voice;
+                utter.lang = (voice && voice.lang) || this.selectedLanguage || 'en-US';
+                utter.rate = 1.25;
+                utter.pitch = 1.0;
+                utter.volume = 1.0;
+                synth.speak(utter);
+            }
         } catch (err) {
             console.error('TTS error:', err);
         }
+    }
+
+    _pickVoice() {
+        try {
+            const synth = window.speechSynthesis;
+            if (!synth) return null;
+            const cacheKey = this.selectedLanguage || 'en-US';
+            if (this._voiceCacheKey === cacheKey && this._cachedVoice) return this._cachedVoice;
+            const voices = synth.getVoices() || [];
+            if (voices.length === 0) return null;
+            const lang = (this.selectedLanguage || 'en-US').toLowerCase();
+            const base = lang.split('-')[0];
+            const preferred = ['daniel', 'samantha', 'ava', 'allison', 'serena', 'zoe', 'evan', 'nathan', 'aria', 'jenny', 'google us english'];
+            const usable = voices.filter(v => {
+                const vl = (v.lang || '').toLowerCase().replace('_', '-');
+                return vl === lang || vl.startsWith(base + '-') || vl === base;
+            });
+            const pool = usable.length > 0 ? usable : voices;
+            const natural = pool.filter(
+                v =>
+                    !/albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|hysterical|jester|organ|superstar|trinoids|whisper|wobble|zarvox|junior|fred|ralph|kathy/i.test(
+                        v.name
+                    )
+            );
+            const candidates = natural.length > 0 ? natural : pool;
+            const rank = v => (/\((?:enhanced|premium)\)|enhanced|premium/i.test(v.name) ? 0 : 1);
+            for (const name of preferred) {
+                const matches = candidates.filter(v => v.name.toLowerCase().includes(name)).sort((a, b) => rank(a) - rank(b));
+                const hit = matches[0];
+                if (hit) {
+                    this._voiceCacheKey = cacheKey;
+                    this._cachedVoice = hit;
+                    return hit;
+                }
+            }
+            const chosen = candidates.find(v => v.localService) || candidates[0] || null;
+            this._voiceCacheKey = cacheKey;
+            this._cachedVoice = chosen;
+            return chosen;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    _toSpokenChunks(text) {
+        const parts = text
+            .split(/(?<=[.!?…])\s+/)
+            .map(t => t.trim())
+            .filter(Boolean);
+        if (parts.length === 0) return [];
+        const chunks = [];
+        for (const part of parts) {
+            const last = chunks[chunks.length - 1];
+            if (last && last.length < 24) {
+                chunks[chunks.length - 1] = `${last} ${part}`;
+            } else if (part.length > 240) {
+                for (const piece of part.split(/(?<=,|;|:)\s+/)) chunks.push(piece.trim());
+            } else {
+                chunks.push(part);
+            }
+        }
+        return chunks.filter(Boolean);
     }
 
     _stopSpeaking() {
@@ -838,7 +1146,8 @@ export class CheatingDaddyApp extends LitElement {
     // take the text content, so headings/lists/code read cleanly without the
     // markup symbols. Falls back to the raw string if marked isn't available.
     _toPlainSpeech(md) {
-        let text = md || '';
+        let text = this._spokenSection(md || '');
+        text = text.replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]+)`/g, '$1');
         try {
             if (window.marked) {
                 const div = document.createElement('div');
@@ -848,7 +1157,23 @@ export class CheatingDaddyApp extends LitElement {
         } catch (err) {
             /* fall back to raw text */
         }
-        return text.replace(/\s+/g, ' ').trim();
+        return text
+            .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2190}-\u{21FF}]/gu, ' ')
+            .replace(/https?:\/\/\S+/g, ' ')
+            .replace(/^\s*[-*•]\s+/gm, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    _spokenSection(md) {
+        const spokenHeading = /(?:⚡|💬)?\s*\*{0,2}(?:quick summary[^:\n]*|what to say[^:\n]*)\*{0,2}\s*:?/i;
+        const nextHeading = /\n\s*(?:📋|💡|🧠|✅|📝)|\n\s*\*{2}[^*\n]+\*{2}\s*:?\s*\n|\n#{1,6}\s/;
+        const start = md.search(spokenHeading);
+        if (start === -1) return md;
+        const afterHeading = md.slice(start).replace(spokenHeading, '');
+        const cut = afterHeading.search(nextHeading);
+        const spoken = (cut === -1 ? afterHeading : afterHeading.slice(0, cut)).replace(/^[\s*:>#-]+/, '').trim();
+        return spoken || md;
     }
 
     // ── Session start ──
@@ -857,6 +1182,8 @@ export class CheatingDaddyApp extends LitElement {
         const prefs = await cheatingDaddy.storage.getPreferences();
         // Pick up any speaker-mode change made in Settings since the app loaded.
         this._speakerMode = prefs.speakerMode ?? false;
+        this._autoAnswer = prefs.autoAnswer ?? true;
+        this.stealthMode = prefs.stealthMode ?? false;
         const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
 
         if (providerMode === 'cloud') {
@@ -1213,7 +1540,7 @@ export class CheatingDaddyApp extends LitElement {
         `;
     }
 
-    renderLiveBar() {
+    renderHud() {
         if (!this._isLiveMode()) return '';
 
         const profileLabels = {
@@ -1223,13 +1550,17 @@ export class CheatingDaddyApp extends LitElement {
             presentation: 'Presentation',
             negotiation: 'Negotiation',
             exam: 'Exam',
+            mcq: 'MCQ',
             relationship: 'Relationship',
         };
+        const mod = cheatingDaddy.isMacOS ? 'Cmd' : 'Ctrl';
+        const state = this._isAudioMuted ? 'paused' : this._autoAnswer ? 'listening' : 'manual';
+        const stateLabel = { paused: 'Paused', listening: 'Listening', manual: 'Manual' }[state];
 
         return html`
-            <div class="live-bar">
-                <div class="live-bar-left">
-                    <button class="live-bar-back" @click=${() => this.handleClose()} title="End session">
+            <header class="hud">
+                <div class="hud-lead">
+                    <button class="hud-back" @click=${() => this.handleClose()} title="End session" aria-label="End session">
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
                             <path
                                 fill-rule="evenodd"
@@ -1238,27 +1569,94 @@ export class CheatingDaddyApp extends LitElement {
                             />
                         </svg>
                     </button>
+                    <span class="hud-state" data-state=${state}>${stateLabel}</span>
                 </div>
-                <div class="live-bar-center">${profileLabels[this.selectedProfile] || 'Session'}</div>
-                <div class="live-bar-right">
-                    ${this.statusText ? html`<span class="live-bar-text">${this.statusText}</span>` : ''}
-                    <span class="live-bar-text">${this.getElapsedTime()}</span>
-                    ${this._isClickThrough ? html`<span class="live-bar-text">[click through]</span>` : ''}
-                    <span
-                        class="live-bar-text clickable ${this._isAudioMuted ? 'muted' : ''}"
-                        title=${`${cheatingDaddy.isMacOS ? 'Cmd' : 'Ctrl'}+Shift+M — ${this._isAudioMuted ? 'resume listening' : 'pause listening'}`}
+                <div class="hud-meta">
+                    <span class="hud-status" aria-live="polite"
+                        >${this.statusText || profileLabels[this.selectedProfile] || 'Session'}${this._isClickThrough ? ' · click through' : ''}</span
+                    >
+                    <span class="hud-clock">${this.getElapsedTime()}</span>
+                </div>
+                <div class="hud-tools">
+                    <button
+                        class="chip"
+                        data-alert=${this._isAudioMuted ? '' : nothing}
+                        aria-pressed=${this._isAudioMuted ? 'true' : 'false'}
+                        title=${`${mod}+Shift+M — ${this._isAudioMuted ? 'resume listening' : 'pause listening'}`}
                         @click=${() => this.handleToggleAudio()}
-                        >${this._isAudioMuted ? '[muted]' : '[mute]'}</span
                     >
-                    <span
-                        class="live-bar-text clickable"
-                        title=${`${cheatingDaddy.isMacOS ? 'Cmd' : 'Ctrl'}+Shift+G — answer the last heard question now`}
-                        @click=${() => this.handleAnswerNow()}
-                        >[answer now]</span
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+                                ${
+                                    this._isAudioMuted
+                                        ? html`<path d="M3 3l18 18M9 5a3 3 0 0 1 6 0v5m-6 1v-1M5 10a7 7 0 0 0 10.7 6M19 10v1M12 19v3" />`
+                                        : html`<path d="M9 5a3 3 0 0 1 6 0v6a3 3 0 0 1-6 0zM5 10v1a7 7 0 0 0 14 0v-1M12 19v3" />`
+                                }
+                            </g>
+                        </svg>
+                        <span class="chip-label">${this._isAudioMuted ? 'Muted' : 'Mic'}</span>
+                    </button>
+                    <button
+                        class="chip"
+                        data-alert=${this._autoAnswer ? nothing : ''}
+                        aria-pressed=${this._autoAnswer ? 'true' : 'false'}
+                        title=${
+                            this._autoAnswer
+                                ? `${mod}+Shift+U — auto answer is on; heard questions are answered automatically. Click to turn off.`
+                                : `${mod}+Shift+U — auto answer is off; speech is only transcribed. Click to turn on.`
+                        }
+                        @click=${() => this.handleToggleAutoAnswer()}
                     >
-                    <span class="live-bar-text clickable" @click=${() => this.handleHideToggle()}>[hide]</span>
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                            <path
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M13 3v7h6l-8 11v-7H5z"
+                            />
+                        </svg>
+                        <span class="chip-label">${this._autoAnswer ? 'Auto' : 'Auto off'}</span>
+                    </button>
+                    <button class="chip" title=${`${mod}+Shift+G — answer the last heard question now`} @click=${() => this.handleAnswerNow()}>
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+                                <path d="M12 3a9 9 0 1 1 0 18a9 9 0 0 1 0-18M9 12h6m-2.5-2.5L15 12l-2.5 2.5" />
+                            </g>
+                        </svg>
+                        <span class="chip-label">Answer</span>
+                    </button>
+                    <button
+                        class="chip"
+                        aria-pressed=${this.stealthMode ? 'true' : 'false'}
+                        title=${
+                            this.stealthMode
+                                ? 'Stealth on — controls hide until you hover the strip. Click for the full HUD.'
+                                : 'Stealth — shrink the HUD to a hairline so only the answer text shows'
+                        }
+                        @click=${() => this.toggleStealth()}
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+                                <path d="M12 3a9 9 0 1 1 0 18a9 9 0 0 1 0-18" />
+                                ${this.stealthMode ? html`<path d="M12 3v18" />` : ''}
+                            </g>
+                        </svg>
+                        <span class="chip-label">Stealth</span>
+                    </button>
+                    <button class="chip" title="Hide the window" @click=${() => this.handleHideToggle()}>
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+                                <path
+                                    d="M3 3l18 18M10.6 5.2A9.6 9.6 0 0 1 12 5c5 0 9 4.5 9 7c0 .8-.5 1.8-1.3 2.8M6.6 6.7C4.5 8.1 3 10.2 3 12c0 2.5 4 7 9 7c1.6 0 3-.5 4.3-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"
+                                />
+                            </g>
+                        </svg>
+                        <span class="chip-label">Hide</span>
+                    </button>
                 </div>
-            </div>
+            </header>
         `;
     }
 
@@ -1282,7 +1680,7 @@ export class CheatingDaddyApp extends LitElement {
                 </div>
                 ${this.renderSidebar()}
                 <div class="content">
-                    ${isLive ? this.renderLiveBar() : ''}
+                    ${isLive ? this.renderHud() : ''}
                     <div class="content-inner ${isLive ? 'live' : ''}">${this.renderCurrentView()}</div>
                 </div>
             </div>

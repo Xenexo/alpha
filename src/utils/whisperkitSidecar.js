@@ -220,6 +220,10 @@ function postTranscription(wavBuffer, language = 'en') {
     });
 }
 
+function supportsModel(modelName) {
+    return !!MODEL_MAP[modelName];
+}
+
 async function loadModel(modelName, language = 'en', contextPrompt = '') {
     const wkModel = MODEL_MAP[modelName];
     if (!wkModel) throw new Error(`No WhisperKit mapping for model ${modelName}`);
@@ -277,7 +281,7 @@ function destroy() {
     servedModel = null;
 }
 
-module.exports = { isAvailable, loadModel, transcribe, destroy };
+module.exports = { isAvailable, supportsModel, loadModel, transcribe, destroy };
 
 // Test seam: exposes the pure arg builder so tests can verify the serve
 // invocation without spawning a real sidecar.

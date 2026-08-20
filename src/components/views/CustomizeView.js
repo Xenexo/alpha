@@ -209,6 +209,7 @@ export class CustomizeView extends LitElement {
         layoutMode: { type: String },
         audioMode: { type: String },
         speakerMode: { type: Boolean },
+        autoAnswer: { type: Boolean },
         keybinds: { type: Object },
         googleSearchEnabled: { type: Boolean },
         backgroundTransparency: { type: Number },
@@ -244,6 +245,7 @@ export class CustomizeView extends LitElement {
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
         this.speakerMode = false;
+        this.autoAnswer = true;
         this.customPrompt = '';
         this._customPrompts = {};
         this._legacyCustomPrompt = '';
@@ -263,6 +265,7 @@ export class CustomizeView extends LitElement {
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
             this.speakerMode = prefs.speakerMode ?? false;
+            this.autoAnswer = prefs.autoAnswer ?? true;
             this._customPrompts = prefs.customPrompts ?? {};
             this._legacyCustomPrompt = prefs.customPrompt ?? '';
             this.customPrompt = this._resolveCustomPrompt(prefs.selectedProfile || this.selectedProfile);
@@ -347,6 +350,7 @@ export class CustomizeView extends LitElement {
             answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
             expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
             toggleSpeakerMode: isMac ? 'Cmd+Shift+P' : 'Ctrl+Shift+P',
+            toggleAutoAnswer: isMac ? 'Cmd+Shift+U' : 'Ctrl+Shift+U',
         };
     }
 
@@ -386,6 +390,11 @@ export class CustomizeView extends LitElement {
                 key: 'toggleSpeakerMode',
                 name: 'Toggle Speaker Mode',
                 description: 'Switch between on-screen answers and audio-only (window hidden, answers spoken aloud)',
+            },
+            {
+                key: 'toggleAutoAnswer',
+                name: 'Toggle Auto Answer',
+                description: 'Stop or resume answering heard questions automatically — speech is still transcribed either way (Claude only)',
             },
         ];
     }
@@ -448,6 +457,13 @@ export class CustomizeView extends LitElement {
     async handleSpeakerModeSelect(e) {
         this.speakerMode = e.target.value === 'speaker';
         await cheatingDaddy.storage.updatePreference('speakerMode', this.speakerMode);
+        cheatingDaddy.refreshPreferencesCache();
+        this.requestUpdate();
+    }
+
+    async handleAutoAnswerSelect(e) {
+        this.autoAnswer = e.target.value === 'auto';
+        await cheatingDaddy.storage.updatePreference('autoAnswer', this.autoAnswer);
         cheatingDaddy.refreshPreferencesCache();
         this.requestUpdate();
     }
@@ -710,10 +726,32 @@ export class CustomizeView extends LitElement {
 
     renderAnswerOutputSection() {
         const shortcut = (this.keybinds && this.keybinds.toggleSpeakerMode) || '';
+        const autoShortcut = (this.keybinds && this.keybinds.toggleAutoAnswer) || '';
         return html`
             <section class="surface">
                 <div class="surface-title">Answer Output</div>
                 <div class="form-grid">
+                    <div class="form-group">
+                        <label class="form-label">Auto Answer${autoShortcut ? html` <span class="keybind-name">· ${autoShortcut}</span>` : ''}</label>
+                        <select class="control" .value=${this.autoAnswer ? 'auto' : 'manual'} @change=${this.handleAutoAnswerSelect}>
+                            <option value="auto">On (answer heard questions automatically)</option>
+                            <option value="manual">Off (only answer when I ask)</option>
+                        </select>
+                    </div>
+                    ${
+                        this.autoAnswer
+                            ? ''
+                            : html`
+                                  <div class="info-callout">
+                                      With Auto Answer off, speech is still transcribed and shown but no answer is generated until you trigger one
+                                      with the Answer With Context
+                                      shortcut${
+                                          this.keybinds && this.keybinds.answerWithContext ? html` (<b>${this.keybinds.answerWithContext}</b>)` : ''
+                                      }
+                                      or the <b>Answer</b> control in the session HUD. Claude mode only.
+                                  </div>
+                              `
+                    }
                     <div class="form-group">
                         <label class="form-label">Answer Delivery</label>
                         <select class="control" .value=${this.speakerMode ? 'speaker' : 'screen'} @change=${this.handleSpeakerModeSelect}>

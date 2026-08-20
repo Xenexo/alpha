@@ -799,6 +799,13 @@ export class MainView extends LitElement {
     async _saveWhisperLanguage(val) {
         this._whisperLanguage = val;
         await cheatingDaddy.storage.updatePreference('whisperLanguage', val);
+        if (val === 'hi' && ['Xenova/whisper-tiny', 'Xenova/whisper-base', 'onnx-community/whisper-large-v3-turbo'].includes(this._whisperModel)) {
+            this._whisperModel = 'onnx-community/whisper-hindi-small-ONNX';
+            await cheatingDaddy.storage.updatePreference('whisperModel', 'onnx-community/whisper-hindi-small-ONNX');
+        } else if (val === 'en' && this._whisperModel === 'onnx-community/whisper-hindi-small-ONNX') {
+            this._whisperModel = 'onnx-community/whisper-large-v3-turbo';
+            await cheatingDaddy.storage.updatePreference('whisperModel', 'onnx-community/whisper-large-v3-turbo');
+        }
         this.requestUpdate();
     }
 
@@ -1076,6 +1083,12 @@ export class MainView extends LitElement {
                     <option value="onnx-community/whisper-large-v3-turbo" ?selected=${this._whisperModel === 'onnx-community/whisper-large-v3-turbo'}>
                         Large v3 Turbo (most accurate, large download)
                     </option>
+                    <option
+                        value="onnx-community/whisper-hindi-small-ONNX"
+                        ?selected=${this._whisperModel === 'onnx-community/whisper-hindi-small-ONNX'}
+                    >
+                        Hindi Small (fine-tuned for Hindi — weak English)
+                    </option>
                 </select>
                 <div class="form-hint">
                     ${this.whisperDownloading ? 'Downloading model...' : 'Used for speech-to-text, downloaded automatically on first use'}
@@ -1098,13 +1111,23 @@ export class MainView extends LitElement {
     // they mistranscribe or drift into English badly enough that users read it
     // as "Hindi doesn't work". Say so where the language is chosen.
     _renderHindiModelHint() {
+        if (this._whisperLanguage !== 'hi') return '';
         const WEAK_FOR_HINDI = ['Xenova/whisper-tiny', 'Xenova/whisper-base'];
-        if (this._whisperLanguage !== 'hi' || !WEAK_FOR_HINDI.includes(this._whisperModel)) return '';
-        return html`
-            <div class="form-hint" style="color: rgba(255, 180, 80, 0.9)">
-                Tiny and Base are near-unusable for Hindi — switch the model above to Large v3 Turbo (or Small) for usable accuracy.
-            </div>
-        `;
+        if (WEAK_FOR_HINDI.includes(this._whisperModel)) {
+            return html`
+                <div class="form-hint" style="color: rgba(255, 180, 80, 0.9)">
+                    Tiny and Base struggle with Hindi — switch the model above to Hindi Small or Large v3 Turbo for clear accuracy.
+                </div>
+            `;
+        }
+        if (this._whisperModel === 'onnx-community/whisper-hindi-small-ONNX') {
+            return html`
+                <div class="form-hint" style="color: rgba(100, 220, 140, 0.9)">
+                    Hindi Small is active — fine-tuned specifically for spoken Hindi and Hinglish accuracy.
+                </div>
+            `;
+        }
+        return '';
     }
 
     // Neural Engine status line under the Whisper model select. The backend

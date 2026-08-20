@@ -1456,6 +1456,19 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         return { success: true, muted };
     });
 
+    ipcMain.handle('toggle-auto-answer', async () => {
+        if (currentProviderMode !== 'claude') {
+            return { success: false, error: 'Auto answer is only available in Claude mode' };
+        }
+        const enabled = getClaude().toggleAutoAnswer();
+        return { success: true, enabled };
+    });
+
+    ipcMain.handle('get-auto-answer', async () => {
+        const enabled = currentProviderMode === 'claude' ? getClaude().isAutoAnswerEnabled() : true;
+        return { success: true, enabled };
+    });
+
     ipcMain.handle('get-audio-mute', async () => {
         const muted = currentProviderMode === 'claude' ? getClaude().isAudioMutedState() : false;
         return { success: true, muted };

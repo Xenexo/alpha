@@ -120,6 +120,7 @@ function getDefaultKeybinds() {
         answerWithContext: isMac ? 'Cmd+Shift+G' : 'Ctrl+Shift+G',
         expandAnswer: isMac ? 'Cmd+Shift+D' : 'Ctrl+Shift+D',
         toggleSpeakerMode: isMac ? 'Cmd+Shift+P' : 'Ctrl+Shift+P',
+        toggleAutoAnswer: isMac ? 'Cmd+Shift+U' : 'Ctrl+Shift+U',
     };
 }
 
@@ -509,6 +510,27 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             }
         } catch (error) {
             console.error(`Failed to register toggleSpeakerMode (${keybinds.toggleSpeakerMode}):`, error);
+        }
+    }
+
+    // Register toggle auto-answer shortcut: stop/resume answering heard speech
+    // automatically. Like speaker mode it must not reveal a hidden window —
+    // silencing the assistant is exactly what you reach for when someone walks up.
+    if (keybinds.toggleAutoAnswer) {
+        try {
+            globalShortcut.register(keybinds.toggleAutoAnswer, () => {
+                console.log('Toggle auto-answer shortcut triggered');
+                sendToRenderer('toggle-auto-answer-shortcut');
+            });
+            if (globalShortcut.isRegistered(keybinds.toggleAutoAnswer)) {
+                console.log(`Registered toggleAutoAnswer: ${keybinds.toggleAutoAnswer}`);
+            } else {
+                console.warn(
+                    `Could not register toggleAutoAnswer (${keybinds.toggleAutoAnswer}) — likely taken by another app. Rebind it in Customize.`
+                );
+            }
+        } catch (error) {
+            console.error(`Failed to register toggleAutoAnswer (${keybinds.toggleAutoAnswer}):`, error);
         }
     }
 

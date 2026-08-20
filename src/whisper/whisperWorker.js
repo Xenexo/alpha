@@ -38,10 +38,23 @@ function getDtypeForModel(modelName) {
     return 'fp16';
 }
 
-// English-only (.en) checkpoints reject language/task; the multilingual ones
-// require them for consistent English output.
-function isEnglishOnly(modelName) {
-    return /\.en$/i.test(modelName) || /\.en[-/]/i.test(modelName);
+// A checkpoint that declares is_multilingual:false makes transformers.js throw
+// on language/task rather than ignore them — and that is not only the .en
+// builds, single-language fine-tunes like whisper-hindi-small declare it too.
+// But those fine-tunes are whisper-small underneath and still carry the whole
+// language token table, so the flag is what is wrong, not the capability.
+// Dropping the language instead makes the decoder auto-detect, which on Hindi
+// audio picks English and returns nothing usable. Force the flag when the
+// tokens exist; only a genuinely English-only build has no table to check.
+function languageOptions(language) {
+    const generationConfig = whisperPipeline && whisperPipeline.model && whisperPipeline.model.generation_config;
+    const base = { language: language || 'en', task: 'transcribe' };
+    if (!generationConfig) return base;
+    const langToId = generationConfig.lang_to_id;
+    if (langToId && Number.isInteger(langToId[`<|${base.language}|>`])) {
+        return { ...base, is_multilingual: true };
+    }
+    return generationConfig.is_multilingual === false ? null : base;
 }
 
 let activeModelName = null;
@@ -49,10 +62,18 @@ let activeModelName = null;
 async function loadModel(modelName) {
     const { pipeline } = await getTransformers();
     log('Loading model on WebGPU:', modelName);
-    whisperPipeline = await pipeline('automatic-speech-recognition', modelName, {
-        device: 'webgpu',
-        dtype: getDtypeForModel(modelName),
-    });
+    try {
+        whisperPipeline = await pipeline('automatic-speech-recognition', modelName, {
+            device: 'webgpu',
+            dtype: getDtypeForModel(modelName),
+        });
+    } catch (fp16Error) {
+        log('fp16 load failed, retrying on q8:', fp16Error.message);
+        whisperPipeline = await pipeline('automatic-speech-recognition', modelName, {
+            device: 'webgpu',
+            dtype: 'q8',
+        });
+    }
     activeModelName = modelName;
 
     // Warm up the graph with 1s of silence so the first real utterance does not
@@ -75,12 +96,19 @@ async function transcribe(audio, samplingRate, language) {
         no_repeat_ngram_size: 3,
         condition_on_previous_text: false,
     };
-    if (!isEnglishOnly(activeModelName)) {
-        options.language = language || 'en';
-        options.task = 'transcribe';
+    Object.assign(options, languageOptions(language));
+    try {
+        const result = await whisperPipeline(audio, options);
+        return result.text?.trim() || '';
+    } catch (error) {
+        if (!/Cannot specify.*(task|language)/i.test(error.message || '')) throw error;
+        log('Model rejected the language options — retrying without them:', error.message);
+        delete options.language;
+        delete options.task;
+        delete options.is_multilingual;
+        const result = await whisperPipeline(audio, options);
+        return result.text?.trim() || '';
     }
-    const result = await whisperPipeline(audio, options);
-    return result.text?.trim() || '';
 }
 
 ipc.on('whisper:load', async ({ id, modelName }) => {

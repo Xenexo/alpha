@@ -33,9 +33,11 @@ const DEFAULT_PREFERENCES = {
     // session and answers are spoken aloud through the speaker instead of shown
     // on screen. Toggled at runtime with the toggleSpeakerMode shortcut.
     speakerMode: false,
+    autoAnswer: true,
+    stealthMode: false,
     fontSize: 'medium',
     backgroundTransparency: 0.8,
-    googleSearchEnabled: false,
+    googleSearchEnabled: true,
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
     whisperModel: 'onnx-community/whisper-large-v3-turbo',
